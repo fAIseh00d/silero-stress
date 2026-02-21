@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 [project]
 name = "silero-stress"
-version = "1.4"
+version = "1.5"
 authors = [
   {name="Silero Team", email="hello@silero.ai"},
 ]
@@ -26,8 +26,17 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
-  "torch>=1.12.0",
+  "numpy>=1.24",
 ]
+
+[project.optional-dependencies]
+torch = ["torch>=2.0"]
+onnx = ["onnxruntime>=1.16"]
+onnx-gpu = ["onnxruntime-gpu>=1.16"]
+all = ["torch>=2.0", "onnxruntime>=1.16"]
+# For re-exporting models from TorchScript
+export = ["torch>=2.0", "onnx>=1.14", "onnxruntime>=1.16", "onnxscript", "transformers>=4.30", "pytest>=7.0"]
+
 [project.urls]
 Homepage = "https://github.com/snakers4/silero-stress"
 Issues = "https://github.com/snakers4/silero-stress/issues"
