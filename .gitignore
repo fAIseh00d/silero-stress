@@ -219,3 +219,4 @@ __marimo__/
 # Parity test results
 reference_1.4.json
 parity_*.json
+scripts/extracted_pt/

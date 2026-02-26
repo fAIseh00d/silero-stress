@@ -515,8 +515,8 @@ torch.onnx.export(tf_bert, dummy_input, 'bert_ru.onnx', ...)
 
 | File | Size | Description |
 |------|------|-------------|
-| `bert_ru.onnx` | 112MB | BERT encoder (all weights internal) |
-| `homo_clf_ru.onnx` | 627KB | Homograph classifier |
+| `bert_ru.onnx.gz` | 30MB | BERT encoder (gzip compressed) |
+| `homo_clf_ru.onnx.gz` | 581KB | Homograph classifier (gzip compressed) |
 
 ### Export Command
 
@@ -728,18 +728,20 @@ These were reported as issues but work correctly in v1.4:
 
 ```bash
 # Run parity tests
-pytest tests/test_parity.py -v
+pytest tests/test_torch_wrapper_parity.py -v
 
 # Run specific test class
-pytest tests/test_parity.py::TestHomographPredictionParity -v
+pytest tests/test_torch_wrapper_parity.py::TestRussianAccentorParity -v
 ```
 
 ### Test Coverage
 
 | Test Class | Coverage |
 |------------|----------|
-| `TestTokenizerParity` | Tokenizer encoding matches PyTorch |
-| `TestBertOutputParity` | BERT hidden states < 1e-4 diff |
-| `TestClassifierParity` | Classifier outputs < 1e-5 diff |
-| `TestHomographPredictionParity` | All 1924 homographs |
-| `TestFullAccentorParity` | End-to-end output match |
+| `TestNgramExtraction` | N-gram algorithm matches original |
+| `TestTokenizationRegex` | Tokenization regex matches |
+| `TestHyphenHandling` | Hyphenated words, `-то` suffix |
+| `TestBertTokenizer` | BERT tokenizer encoding |
+| `TestRussianAccentorParity` | RU: NumPy vs PyTorch parity |
+| `TestUkrainianAccentorParity` | UKR: NumPy vs PyTorch parity |
+| `TestBelarusianAccentorParity` | BEL: NumPy vs PyTorch parity |

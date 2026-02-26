@@ -10,12 +10,18 @@ The original silero-stress library uses PyTorch (~2GB dependency) for inference.
 
 ### Performance Comparison
 
-| Metric | PyTorch | NumPy | Improvement |
-|--------|---------|-------|-------------|
-| **Per-sentence latency (RU)** | 4.35ms | 2.95ms | **1.5x faster** |
-| **Per-sentence latency (UKR)** | 0.95ms | 0.20ms | **4.7x faster** |
-| **Per-sentence latency (BEL)** | 1.00ms | 0.20ms | **4.9x faster** |
+| Backend | 100 sentences (RU) | vs PyTorch CPU |
+|---------|-------------------|----------------|
+| PyTorch CPU | 460ms | 1.0x |
+| PyTorch CUDA | 420ms | 1.1x |
+| **ONNX CPU** | 232ms | **2.0x** |
+| ONNX CUDA | 152ms | 3.0x |
+| **ONNX TensorRT** | 119ms | **3.9x** |
+
+| Metric | PyTorch | NumPy/ONNX | Improvement |
+|--------|---------|------------|-------------|
 | **Import memory** | ~2GB (torch) | ~25MB (numpy) | **80x smaller** |
+| **Dependencies** | torch>=2.0 | numpy + onnxruntime | Much lighter |
 
 *See [Benchmarks](#benchmarks) section for methodology. Run `scripts/benchmark.py` to reproduce.*
 
@@ -255,6 +261,30 @@ exceptions = {
 }
 ```
 
+### Tokenization
+
+Sentences are split using: `r'([\s.,!?;:<>=()/\\]+)'`
+
+#### Hyphenated Words (Russian)
+
+Hyphenated words are split into parts, each processed separately:
+- `что-то` → `['что-', 'то']`
+- `кому-то` → `['кому-', 'то']`
+
+**Special case**: The `-то` suffix (indefinite particle) is never stressed:
+```
+что-то  → чт+о-то   (stress on "что", not "то")
+кому-то → ком+у-то  (stress on "кому", not "то")
+```
+
+### Language-Specific Details
+
+| Language | Vowels | Alphabet Pattern |
+|----------|--------|------------------|
+| **RU** | `аоуыэиеяёю` | `[А-Яа-яёЁ]` |
+| **UKR** | `аеєиіїоуюя` | `[а-яєіїґА-ЯЄІЇҐь']` |
+| **BEL** | `аоуіэыяеёю` | `[а-яёіўА-ЯЁІЎь']` |
+
 ## Why NumPy is Faster Than PyTorch
 
 1. **No TorchScript interpreter overhead**: The original model runs n-gram extraction in TorchScript's Python interpreter, which is slower than native Python/NumPy.
@@ -318,73 +348,61 @@ This validates the decision to use pure NumPy for n-gram classifiers while only 
 ### Running Benchmarks
 
 ```bash
-# Run benchmark comparing PyTorch vs NumPy backends
+# Auto-detect all available backends and devices
 PYTHONPATH=src python scripts/benchmark.py
 
-# NumPy only (no torch required)
-PYTHONPATH=src python scripts/benchmark.py --numpy-only
+# ONNX only (no torch required)
+PYTHONPATH=src python scripts/benchmark.py --onnx-only
 
-# Single language
-PYTHONPATH=src python scripts/benchmark.py --lang ru
+# PyTorch only
+PYTHONPATH=src python scripts/benchmark.py --torch-only
 ```
 
 The benchmark:
-1. Loads both backends with homograph solver enabled for Russian
-2. Runs 50 warmup iterations (ensures JIT compilation for PyTorch)
-3. Benchmarks 500 iterations per language
-4. Reports per-sentence latency, load times, and percentiles
+1. Auto-detects available ONNX providers (CPU, CUDA, TensorRT, ROCm, OpenVINO, CoreML, DirectML)
+2. Auto-detects PyTorch CUDA availability
+3. Runs 10 warmup + 50 benchmark iterations
+4. Reports per-100-sentence throughput and single homograph-heavy sentence latency
 
 ### Test Setup
 
 - **CPU**: Intel Xeon E5-2680 v4 (14C/28T)
-- **GPU**: 2x RTX 3090, 1x RTX A4000
+- **GPU**: NVIDIA RTX 3090
 - **OS**: Ubuntu 24.04 (Linux 6.8)
 - **Python**: 3.12.3
 - **NumPy**: 2.4.2
 - **PyTorch**: 2.9.1+cu130 (single thread, `torch.set_num_threads(1)`)
 - **ONNX Runtime GPU**: 1.24.2
 
-### Results
+### Results (Russian with Homograph Solver)
 
-#### Per-Sentence Latency (after warmup)
+| Backend        | Load    | 100 sentences    | 1 sent (7 homo)  |
+|----------------|---------|------------------|------------------|
+| torch_cpu      |   672ms |  460.6ms (0.5x)  |  20.23ms (0.4x)  |
+| torch_cuda     |   904ms |  419.5ms (0.6x)  |   8.89ms (0.9x)  |
+| onnx_cpu       |   784ms |  231.5ms (1.0x)  |   8.24ms (1.0x)  |
+| onnx_cuda      |   841ms |  151.9ms (1.5x)  |   3.04ms (2.7x)  |
+| onnx_tensorrt  |  1924ms |  119.1ms (1.9x)  |   2.42ms (3.4x)  |
 
-| Lang | PyTorch | NumPy | Speedup |
-|------|---------|-------|---------|
-| **RU** | 4.35ms | 2.95ms | **1.5x** |
-| **UKR** | 0.95ms | 0.20ms | **4.7x** |
-| **BEL** | 1.00ms | 0.20ms | **4.9x** |
-
-*Russian is slower due to BERT homograph solver overhead (ONNX). Without homosolver, Russian matches UKR/BEL speeds.*
-
-#### Load Time
-
-| Lang | PyTorch | NumPy | Speedup |
-|------|---------|-------|---------|
-| **RU** | 738ms | 942ms | 0.8x |
-| **UKR** | 77ms | 80ms | 1.0x |
-| **BEL** | 108ms | 71ms | 1.5x |
-
-*Russian load time is dominated by ONNX session creation for BERT. PyTorch wins here due to lazy loading.*
-
-#### Detailed Metrics (Russian)
-
-```
-[PyTorch backend]
-  Load time:       748.1ms
-  Per batch:       13.63ms ± 0.37ms  (5 sentences)
-  Per sentence:    2.727ms
-  P50/P95/P99:     13.49 / 14.38 / 14.65ms
-  Min/Max:         13.07 / 15.13ms
-
-[NumPy backend]
-  Load time:       957.5ms
-  Per batch:        5.59ms ± 0.11ms  (5 sentences)
-  Per sentence:    1.119ms
-  P50/P95/P99:     5.57 / 5.75 / 5.94ms
-  Min/Max:         5.50 / 7.30ms
-```
+**Key findings:**
+- ONNX CPU is **2.0x faster** than PyTorch CPU
+- ONNX TensorRT is **1.9x faster** than ONNX CPU for throughput
+- ONNX TensorRT is **3.4x faster** than ONNX CPU for homograph-heavy sentences
+- TensorRT has higher load time due to engine compilation (cached after first run)
 
 ## Limitations
+
+### Floating-Point Precision
+
+Some words may show different stress predictions between NumPy and PyTorch backends due to floating-point precision differences:
+
+```
+замок (no context) → NumPy: "зам+ок" (lock), PyTorch: "з+амок" (castle)
+```
+
+This happens when model confidence is low and argmax can flip between predictions. Both outputs are valid interpretations. For exact PyTorch parity, use `backend='torch'`.
+
+### Architecture Constraints
 
 None significant. The architecture is optimized for the workload:
 - N-gram MLP: CPU-bound, NumPy is optimal

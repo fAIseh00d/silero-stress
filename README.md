@@ -34,8 +34,10 @@ For 19 other languages please refer [here](https://github.com/snakers4/silero-st
   - A modern CPU with AVX, AVX2, AVX-512 or AMX instruction sets.
 
   Dependencies:
-  
-  - `torch>=1.12.0`;
+
+  - `numpy>=1.24` (base)
+  - `torch>=2.0` (optional, for PyTorch backend)
+  - `onnxruntime>=1.16` (optional, for Russian homographs)
 
 </details>
 
@@ -96,7 +98,7 @@ You can:
 
 - **Minimal and minified**
 
-   Code bloat, unnecessary dependencies and libraries are removed. Silero Stress depends only on PyTorch as a neural engine and the Python standard library.
+   Code bloat, unnecessary dependencies and libraries are removed. Silero Stress uses NumPy by default (~25MB), with optional PyTorch backend or ONNX Runtime for GPU acceleration.
 
 - **Other Languages**
 

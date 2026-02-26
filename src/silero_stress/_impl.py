@@ -323,31 +323,111 @@ class OnnxHomosolver:
         if not tagged:
             return text
 
+        # Use batched inference for efficiency
+        resolved = self._resolve_batch(tagged, put_stress_homo, put_yo_homo, stress_single_vowel)
+
+        # Apply replacements
         result = text
         offset = 0
+        for start, end, word, word_pred_cased, extra_offset in resolved:
+            actual_start = start + offset
+            actual_end = end + offset
+            result = result[:actual_start] + word_pred_cased + result[actual_end:]
+            offset += extra_offset
 
-        for start, end, word, marked_text in tagged:
-            input_ids = self._encode_marked(marked_text)
-            if input_ids is None:
-                continue
+        return result
 
-            homo_start = np.where(input_ids[0] == self.tokenizer.homo_start_id)[0]
-            homo_end = np.where(input_ids[0] == self.tokenizer.homo_end_id)[0]
+    def _find_and_tag_homos(self, text, put_stress_homo, put_yo_homo):
+        """Find homographs and create marked versions."""
+        tagged = []
+        for match in self.pattern.finditer(text):
+            word = match.group()
+            word_lower = word.lower()
+            start, end = match.start(), match.end()
 
-            if len(homo_start) == 0 or len(homo_end) == 0:
-                continue
+            is_stress_homo = word_lower in self.homodict and put_stress_homo
+            is_yo_homo = word_lower in self.yohomodict and put_yo_homo
 
-            homo_start = homo_start[0]
-            homo_end = homo_end[0]
+            if is_stress_homo or is_yo_homo:
+                marked = text[:start] + ' [HOMO] ' + word + ' [/HOMO] ' + text[end:]
+                tagged.append((start, end, word, marked))
+        return tagged
 
-            hidden_states = self.bert_session.run(None, {'input_ids': input_ids})[0]
-            marker_emb = hidden_states[0, homo_start, :]
-            word_tokens = hidden_states[0, homo_start + 1:homo_end, :]
+    def _encode_marked(self, marked_text):
+        """Encode text with [HOMO] markers."""
+        ids = self.tokenizer.encode(marked_text)
+        return np.array([ids], dtype=np.int64)
+
+    def _resolve_batch(self, tagged, put_stress_homo, put_yo_homo, stress_single_vowel):
+        """Resolve multiple homographs with batched BERT inference.
+
+        Args:
+            tagged: List of (start, end, word, marked_text) tuples
+            put_stress_homo: Add stress marks to homographs
+            put_yo_homo: Replace е with ё in homographs
+            stress_single_vowel: Add stress even for single-vowel words
+
+        Returns:
+            List of (start, end, word, predicted_word, extra_offset) tuples
+        """
+        if not tagged:
+            return []
+
+        # Step 1: Tokenize all marked texts
+        all_ids = []
+        valid_indices = []  # Track which tagged entries have valid tokens
+
+        for i, (start, end, word, marked_text) in enumerate(tagged):
+            ids = self.tokenizer.encode(marked_text)
+            homo_start = None
+            homo_end = None
+
+            for j, token_id in enumerate(ids):
+                if token_id == self.tokenizer.homo_start_id:
+                    homo_start = j
+                elif token_id == self.tokenizer.homo_end_id:
+                    homo_end = j
+                    break
+
+            if homo_start is not None and homo_end is not None:
+                all_ids.append((ids, homo_start, homo_end))
+                valid_indices.append(i)
+
+        if not all_ids:
+            return []
+
+        # Step 2: Pad to same length (pad_token_id=0)
+        max_len = max(len(ids) for ids, _, _ in all_ids)
+        batch_ids = np.zeros((len(all_ids), max_len), dtype=np.int64)
+        homo_starts = []
+        homo_ends = []
+
+        for i, (ids, hs, he) in enumerate(all_ids):
+            batch_ids[i, :len(ids)] = ids
+            homo_starts.append(hs)
+            homo_ends.append(he)
+
+        # Step 3: Run BERT once on the batch
+        hidden_states = self.bert_session.run(None, {'input_ids': batch_ids})[0]
+
+        # Step 4: Extract embeddings for all homographs
+        embeddings = np.empty((len(all_ids), 624), dtype=np.float32)  # 312*2
+        for i, (hs, he) in enumerate(zip(homo_starts, homo_ends)):
+            marker_emb = hidden_states[i, hs, :]
+            word_tokens = hidden_states[i, hs + 1:he, :]
             word_emb = word_tokens.mean(axis=0)
-            combined = np.concatenate([marker_emb, word_emb]).reshape(1, -1).astype(np.float32)
+            embeddings[i] = np.concatenate([marker_emb, word_emb])
 
-            logit = self.clf_session.run(None, {'embedding': combined})[0]
-            pred = 1 if 1 / (1 + np.exp(-logit[0, 0])) > 0.5 else 0
+        # Step 5: Run classifier on all embeddings at once
+        logits = self.clf_session.run(None, {'embedding': embeddings})[0]
+        sigmoid_vals = 1 / (1 + np.exp(-logits[:, 0]))
+        preds = (sigmoid_vals > 0.5).astype(np.int32)
+
+        # Step 6: Map predictions back to original positions
+        results = []
+        for idx, valid_i in enumerate(valid_indices):
+            start, end, word, _ = tagged[valid_i]
+            pred = preds[idx]
 
             word_lower = word.lower()
             if word_lower in self.homodict:
@@ -380,33 +460,9 @@ class OnnxHomosolver:
             else:
                 extra_offset = 0
 
-            actual_start = start + offset
-            actual_end = end + offset
-            result = result[:actual_start] + word_pred_cased + result[actual_end:]
-            offset += extra_offset
+            results.append((start, end, word, word_pred_cased, extra_offset))
 
-        return result
-
-    def _find_and_tag_homos(self, text, put_stress_homo, put_yo_homo):
-        """Find homographs and create marked versions."""
-        tagged = []
-        for match in self.pattern.finditer(text):
-            word = match.group()
-            word_lower = word.lower()
-            start, end = match.start(), match.end()
-
-            is_stress_homo = word_lower in self.homodict and put_stress_homo
-            is_yo_homo = word_lower in self.yohomodict and put_yo_homo
-
-            if is_stress_homo or is_yo_homo:
-                marked = text[:start] + ' [HOMO] ' + word + ' [/HOMO] ' + text[end:]
-                tagged.append((start, end, word, marked))
-        return tagged
-
-    def _encode_marked(self, marked_text):
-        """Encode text with [HOMO] markers."""
-        ids = self.tokenizer.encode(marked_text)
-        return np.array([ids], dtype=np.int64)
+        return results
 
 
 class _AccentorBase:
@@ -476,6 +532,8 @@ class AccentorUkrBel(_AccentorBase):
 
     # Pre-compiled regex for tokenization
     _TOKEN_SPLIT_RE = re.compile(r'([\s.,!?;:<>=()/\\]+)')
+    # Sentence boundary pattern (split on .!? followed by space or end)
+    _SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
 
     def __init__(self, lang):
         super().__init__(lang)
@@ -528,8 +586,15 @@ class AccentorUkrBel(_AccentorBase):
         logits = self._classify(embeddings, self.stress_weights)
         return np.argmax(logits, axis=1).tolist()
 
-    def __call__(self, sentence, **kwargs):
-        """Process sentence and add stress marks."""
+    def __call__(self, text, **kwargs):
+        """Process text and add stress marks. Auto-batches if multiple sentences detected."""
+        # Auto-batch if multiple sentences
+        sentences = self._SENTENCE_SPLIT_RE.split(text)
+        if len(sentences) > 1:
+            return ' '.join(self.batch(sentences))
+
+        # Single sentence path
+        sentence = text
         raw_tokens = []
         clean_tokens = []
         needs_processing = []
@@ -576,6 +641,94 @@ class AccentorUkrBel(_AccentorBase):
 
         return ''.join(result)
 
+    def batch(self, sentences):
+        """Process multiple sentences in a single batch for better throughput.
+
+        Args:
+            sentences: List of input sentences
+
+        Returns:
+            List of processed sentences with stress marks
+        """
+        if not sentences:
+            return []
+
+        # 1. Tokenize all sentences
+        all_raw_tokens = []      # raw tokens per sentence
+        all_clean_tokens = []    # cleaned tokens per sentence
+        all_needs_processing = []  # flags per sentence
+
+        for sentence in sentences:
+            raw_tokens = []
+            clean_tokens = []
+            needs_processing = []
+
+            for part in self._TOKEN_SPLIT_RE.split(sentence):
+                subparts = part.split('-')
+                if len(subparts) == 1:
+                    tokens = subparts
+                else:
+                    tokens = [p + '-' for p in subparts[:-1]] + [subparts[-1]]
+
+                for token in tokens:
+                    raw_tokens.append(token)
+                    clean = self._clean_re.sub('', token.lower())
+                    clean_tokens.append(clean)
+                    needs_processing.append(len(clean) > 0)
+
+            all_raw_tokens.append(raw_tokens)
+            all_clean_tokens.append(clean_tokens)
+            all_needs_processing.append(needs_processing)
+
+        # 2. Collect all words that need prediction (across all sentences)
+        words_to_predict = []
+        word_locations = []  # (sentence_idx, token_idx)
+        exception_results = {}  # (sentence_idx, token_idx) -> stress_pos
+
+        for sent_idx, (raw_tokens, clean_tokens, needs_processing) in enumerate(
+            zip(all_raw_tokens, all_clean_tokens, all_needs_processing)
+        ):
+            for tok_idx, (raw, clean, need) in enumerate(zip(raw_tokens, clean_tokens, needs_processing)):
+                if need and self.stress_token not in raw.lower():
+                    if clean in self.exceptions:
+                        exception_results[(sent_idx, tok_idx)] = self.exceptions[clean][0]
+                    else:
+                        words_to_predict.append(clean)
+                        word_locations.append((sent_idx, tok_idx))
+
+        # 3. Batch predict all words at once
+        if words_to_predict:
+            embeddings = self._embed_words(words_to_predict)
+            logits = self._classify(embeddings, self.stress_weights)
+            predictions = np.argmax(logits, axis=1)
+        else:
+            predictions = []
+
+        # 4. Build prediction map
+        pred_map = {}
+        for i, (sent_idx, tok_idx) in enumerate(word_locations):
+            pred_map[(sent_idx, tok_idx)] = predictions[i]
+
+        # 5. Reassemble all sentences
+        results = []
+        for sent_idx, (raw_tokens, clean_tokens, needs_processing) in enumerate(
+            zip(all_raw_tokens, all_clean_tokens, all_needs_processing)
+        ):
+            result_tokens = []
+            for tok_idx, (raw, clean, need) in enumerate(zip(raw_tokens, clean_tokens, needs_processing)):
+                key = (sent_idx, tok_idx)
+                if not need or self.stress_token in raw.lower():
+                    result_tokens.append(raw)
+                elif key in exception_results:
+                    result_tokens.append(self._accentuate_word(raw, exception_results[key], is_char_pos=True))
+                elif key in pred_map:
+                    result_tokens.append(self._accentuate_word(raw, pred_map[key], is_char_pos=False))
+                else:
+                    result_tokens.append(raw)
+            results.append(''.join(result_tokens))
+
+        return results
+
 
 class AccentorRu(_AccentorBase):
     """Accentor for Russian with optional BERT homograph solver."""
@@ -583,6 +736,8 @@ class AccentorRu(_AccentorBase):
     # Pre-compiled regex patterns
     _TOKEN_SPLIT_RE = re.compile(r'([\s.,!?;:<>=()/\\]+)')
     _CLEAN_RE = re.compile(r'[^А-Яа-яёЁ]')
+    # Sentence boundary pattern
+    _SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
 
     def __init__(self, use_homosolver=True, device='cpu'):
         super().__init__('ru')
@@ -666,18 +821,27 @@ class AccentorRu(_AccentorBase):
                 return word[:char_idx] + 'Ё' + word[char_idx + 1:]
             return word
 
-    def __call__(self, sentence, put_stress=True, put_yo=True,
+    def __call__(self, text, put_stress=True, put_yo=True,
                  put_stress_homo=True, put_yo_homo=True, stress_single_vowel=True, **kwargs):
-        """Process sentence.
+        """Process text and add stress marks. Auto-batches if multiple sentences detected.
 
         Args:
-            sentence: Input text
+            text: Input text (single sentence or multiple)
             put_stress: Add stress marks to words
             put_yo: Replace е with ё where appropriate
             put_stress_homo: Add stress marks to homographs (requires homosolver)
             put_yo_homo: Replace е with ё in homographs (requires homosolver)
             stress_single_vowel: Add stress even for single-vowel words
         """
+        # Auto-batch if multiple sentences
+        sentences = self._SENTENCE_SPLIT_RE.split(text)
+        if len(sentences) > 1:
+            return ' '.join(self.batch(sentences, put_stress=put_stress, put_yo=put_yo,
+                                       stress_single_vowel=stress_single_vowel,
+                                       put_stress_homo=put_stress_homo, put_yo_homo=put_yo_homo))
+
+        # Single sentence path
+        sentence = text
         if self.homosolver and (put_stress_homo or put_yo_homo):
             sentence = self.homosolver(sentence, put_stress_homo, put_yo_homo, stress_single_vowel)
 
@@ -692,14 +856,19 @@ class AccentorRu(_AccentorBase):
             subparts = part.split('-')
             if len(subparts) == 1:
                 tokens = subparts
+                # Single token - process if non-empty
+                process_flags = [True]
             else:
                 tokens = [p + '-' for p in subparts[:-1]] + [subparts[-1]]
+                # Special case: don't process '-то' suffix (что-то, кому-то, etc.)
+                # This matches original PyTorch behavior for backward compatibility
+                process_flags = [True] * (len(subparts) - 1) + [subparts[-1].lower() != 'то']
 
-            for token in tokens:
+            for token, should_process in zip(tokens, process_flags):
                 raw_tokens.append(token)
                 clean = self._CLEAN_RE.sub('', token.lower())
                 clean_tokens.append(clean)
-                needs_processing.append(len(clean) > 0)
+                needs_processing.append(len(clean) > 0 and should_process)
 
         stress_words_to_predict = []
         stress_word_indices = []
@@ -836,3 +1005,195 @@ class AccentorRu(_AccentorBase):
                     stress_pred_idx += 1
 
         return ''.join(result_tokens)
+
+    def batch(self, sentences, put_stress=True, put_yo=True, stress_single_vowel=True,
+              put_stress_homo=True, put_yo_homo=True):
+        """Process multiple sentences in a single batch for better throughput.
+
+        Note: Homograph resolution (BERT) is currently processed per-sentence.
+        MLP-based stress and yo prediction is fully batched.
+
+        Args:
+            sentences: List of input sentences
+            put_stress: Add stress marks to words
+            put_yo: Replace е with ё where appropriate
+            stress_single_vowel: Add stress even for single-vowel words
+            put_stress_homo: Add stress marks to homographs
+            put_yo_homo: Replace е with ё in homographs
+
+        Returns:
+            List of processed sentences
+        """
+        if not sentences:
+            return []
+
+        # Process homographs first (per-sentence for now, BERT batching requires re-export)
+        if self.homosolver and (put_stress_homo or put_yo_homo):
+            sentences = [self.homosolver(s, put_stress_homo, put_yo_homo, stress_single_vowel)
+                         for s in sentences]
+
+        if not put_stress and not put_yo:
+            return list(sentences)
+
+        # 1. Tokenize all sentences
+        all_raw_tokens = []
+        all_clean_tokens = []
+        all_needs_processing = []
+
+        for sentence in sentences:
+            raw_tokens = []
+            clean_tokens = []
+            needs_processing = []
+
+            for part in self._TOKEN_SPLIT_RE.split(sentence):
+                subparts = part.split('-')
+                if len(subparts) == 1:
+                    tokens = subparts
+                    process_flags = [True]
+                else:
+                    tokens = [p + '-' for p in subparts[:-1]] + [subparts[-1]]
+                    # Special case: don't process '-то' suffix (что-то, кому-то, etc.)
+                    process_flags = [True] * (len(subparts) - 1) + [subparts[-1].lower() != 'то']
+
+                for token, should_process in zip(tokens, process_flags):
+                    raw_tokens.append(token)
+                    clean = self._CLEAN_RE.sub('', token.lower())
+                    clean_tokens.append(clean)
+                    needs_processing.append(len(clean) > 0 and should_process)
+
+            all_raw_tokens.append(raw_tokens)
+            all_clean_tokens.append(clean_tokens)
+            all_needs_processing.append(needs_processing)
+
+        # 2. Collect words for stress prediction
+        stress_words = []
+        stress_locations = []  # (sent_idx, tok_idx)
+        exception_stress = {}  # (sent_idx, tok_idx) -> char_pos
+
+        # 3. Collect words for yo prediction
+        yo_words = []
+        yo_locations = []
+        exception_yo = {}
+
+        for sent_idx, (raw_tokens, clean_tokens, needs_processing) in enumerate(
+            zip(all_raw_tokens, all_clean_tokens, all_needs_processing)
+        ):
+            for tok_idx, (raw, clean, need) in enumerate(zip(raw_tokens, clean_tokens, needs_processing)):
+                if not need:
+                    continue
+                key = (sent_idx, tok_idx)
+                has_stress = self.stress_token in raw.lower()
+
+                if clean in self.exceptions:
+                    exc = self.exceptions[clean]
+                    if put_stress and not has_stress:
+                        exception_stress[key] = exc[0]
+                    if put_yo and len(exc) > 1 and exc[1] >= 0:
+                        exception_yo[key] = exc[1]
+                else:
+                    if put_stress and not has_stress:
+                        stress_words.append(clean)
+                        stress_locations.append(key)
+                    if put_yo and 'е' in clean:
+                        yo_words.append(clean)
+                        yo_locations.append(key)
+
+        # 4. Batch predict stress
+        if stress_words:
+            stress_embeddings = self._embed_words(stress_words)
+            stress_logits = self._classify(stress_embeddings, self.stress_weights)
+            stress_preds = np.argmax(stress_logits, axis=1)
+        else:
+            stress_preds = []
+
+        stress_pred_map = {loc: stress_preds[i] for i, loc in enumerate(stress_locations)}
+
+        # 5. Batch predict yo (reuse embeddings for stress check)
+        if yo_words:
+            yo_embeddings = self._embed_words(yo_words)
+            yo_logits = self._classify(yo_embeddings, self.yo_weights)
+            yo_preds = np.argmax(yo_logits, axis=1)
+            # Also get stress predictions for yo words
+            yo_stress_logits = self._classify(yo_embeddings, self.stress_weights)
+            yo_stress_preds = np.argmax(yo_stress_logits, axis=1)
+        else:
+            yo_preds = []
+            yo_stress_preds = []
+
+        yo_pred_map = {loc: yo_preds[i] for i, loc in enumerate(yo_locations)}
+        yo_stress_map = {loc: yo_stress_preds[i] for i, loc in enumerate(yo_locations)}
+
+        # 6. Reassemble all sentences
+        results = []
+        for sent_idx, (raw_tokens, clean_tokens, needs_processing) in enumerate(
+            zip(all_raw_tokens, all_clean_tokens, all_needs_processing)
+        ):
+            result_tokens = list(raw_tokens)
+
+            # Apply yo replacements first
+            if put_yo:
+                for tok_idx, (raw, clean, need) in enumerate(zip(raw_tokens, clean_tokens, needs_processing)):
+                    if not need:
+                        continue
+                    key = (sent_idx, tok_idx)
+
+                    if key in exception_yo:
+                        yo_char_pos = exception_yo[key]
+                        has_stress = self.stress_token in raw
+                        if has_stress:
+                            stress_marker_idx = raw.lower().index(self.stress_token)
+                            if stress_marker_idx == yo_char_pos:
+                                result_tokens[tok_idx] = self._yo_replace_word(result_tokens[tok_idx], yo_char_pos, is_char_pos=True)
+                        elif key in exception_stress:
+                            if exception_stress[key] == yo_char_pos:
+                                result_tokens[tok_idx] = self._yo_replace_word(result_tokens[tok_idx], yo_char_pos, is_char_pos=True)
+                        else:
+                            result_tokens[tok_idx] = self._yo_replace_word(result_tokens[tok_idx], yo_char_pos, is_char_pos=True)
+
+                    elif key in yo_pred_map:
+                        yo_pos = yo_pred_map[key]
+                        if yo_pos == 0:
+                            continue
+
+                        e_positions = [j for j, c in enumerate(clean) if c == 'е']
+                        vowel_positions = [j for j, c in enumerate(clean) if c in self.vowels]
+                        yo_char_idx = e_positions[yo_pos - 1] if yo_pos - 1 < len(e_positions) else None
+
+                        if yo_char_idx is None:
+                            continue
+
+                        has_stress = self.stress_token in raw
+                        if has_stress:
+                            stress_marker_idx = raw.lower().index(self.stress_token)
+                            if stress_marker_idx + 1 < len(raw):
+                                stressed_char = raw[stress_marker_idx + 1].lower()
+                                if stressed_char == 'е':
+                                    actual_stressed_char_idx = stress_marker_idx
+                                    if actual_stressed_char_idx == yo_char_idx:
+                                        result_tokens[tok_idx] = self._yo_replace_word(result_tokens[tok_idx], yo_pos - 1, is_char_pos=False)
+                        else:
+                            stress_pred = yo_stress_map.get(key, 0)
+                            stressed_char_idx = vowel_positions[stress_pred] if stress_pred < len(vowel_positions) else None
+                            if stressed_char_idx is not None and stressed_char_idx == yo_char_idx:
+                                result_tokens[tok_idx] = self._yo_replace_word(result_tokens[tok_idx], yo_pos - 1, is_char_pos=False)
+
+            # Apply stress marks
+            if put_stress:
+                for tok_idx, (clean, need) in enumerate(zip(clean_tokens, needs_processing)):
+                    if not need or self.stress_token in result_tokens[tok_idx].lower():
+                        continue
+
+                    key = (sent_idx, tok_idx)
+                    num_vowels = sum(1 for c in clean if c in self.vowels)
+
+                    if num_vowels == 1 and not stress_single_vowel:
+                        continue
+
+                    if key in exception_stress:
+                        result_tokens[tok_idx] = self._accentuate_word(result_tokens[tok_idx], exception_stress[key], is_char_pos=True)
+                    elif key in stress_pred_map:
+                        result_tokens[tok_idx] = self._accentuate_word(result_tokens[tok_idx], stress_pred_map[key], is_char_pos=False)
+
+            results.append(''.join(result_tokens))
+
+        return results

@@ -151,25 +151,32 @@ def export_onnx():
     tf_bert.load_state_dict(state_dict, strict=False)
     tf_bert.eval()
 
-    # Test with same input
-    dummy_input = torch.tensor([[2, 3280, 83828, 29600, 83829, 18, 3]], dtype=torch.int64)
+    # Test with single input first
+    single_input = torch.tensor([[2, 3280, 83828, 29600, 83829, 18, 3]], dtype=torch.int64)
 
     with torch.no_grad():
         # Original PyTorch model
-        pt_out = bert(dummy_input)[0]
+        pt_out = bert(single_input)[0]
 
         # Transformers model
-        tf_out = tf_bert(dummy_input).last_hidden_state
+        tf_out = tf_bert(single_input).last_hidden_state
 
     print(f"PyTorch output[:5]: {pt_out[0, 3, :5].tolist()}")
     print(f"Transformers output[:5]: {tf_out[0, 3, :5].tolist()}")
     print(f"Max diff: {(pt_out - tf_out).abs().max():.6f}")
 
-    # Export to ONNX
+    # Export to ONNX with batch>1 dummy input to ensure dynamic batch dim
+    # Use batch=2 with different lengths (padded) to force proper dynamic axes
+    # pad_token_id=0 for BERT
+    dummy_batch = torch.tensor([
+        [2, 3280, 83828, 29600, 83829, 18, 3],  # seq_len=7
+        [2, 1234, 5678, 9012, 3, 0, 0],          # seq_len=5, padded to 7
+    ], dtype=torch.int64)
+
     onnx_path = EXPORT_DIR / 'bert_ru.onnx'
     torch.onnx.export(
         tf_bert,
-        dummy_input,
+        dummy_batch,
         str(onnx_path),
         input_names=['input_ids'],
         output_names=['hidden_states'],
@@ -181,13 +188,21 @@ def export_onnx():
     )
     print(f"Saved to {onnx_path}")
 
-    # Verify ONNX
+    # Verify ONNX with both single and batched inputs
     import onnxruntime as ort
     session = ort.InferenceSession(str(onnx_path))
-    onnx_out = session.run(None, {'input_ids': dummy_input.numpy()})[0]
 
-    diff = np.abs(pt_out.numpy() - onnx_out).max()
-    print(f"ONNX vs PyTorch max diff: {diff:.6f}")
+    # Test single input
+    onnx_out_single = session.run(None, {'input_ids': single_input.numpy()})[0]
+    diff_single = np.abs(pt_out.numpy() - onnx_out_single).max()
+    print(f"ONNX vs PyTorch (batch=1) max diff: {diff_single:.6f}")
+
+    # Test batched input
+    with torch.no_grad():
+        pt_out_batch = bert(dummy_batch)[0]
+    onnx_out_batch = session.run(None, {'input_ids': dummy_batch.numpy()})[0]
+    diff_batch = np.abs(pt_out_batch.numpy() - onnx_out_batch).max()
+    print(f"ONNX vs PyTorch (batch=2) max diff: {diff_batch:.6f}")
 
     return onnx_path
 

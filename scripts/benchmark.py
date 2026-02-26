@@ -1,235 +1,262 @@
 #!/usr/bin/env python3
 """
-Benchmark: compare PyTorch vs NumPy/ONNX performance.
+Benchmark silero-stress across all available backends and devices.
+
+Auto-detects available ONNX providers and PyTorch CUDA support.
 
 Usage:
-    # Benchmark both backends (requires torch venv):
-    PYTHONPATH=src .venv/bin/python scripts/benchmark.py
-
-    # Benchmark numpy only (works in onnx_venv):
-    PYTHONPATH=src .onnx_venv/bin/python scripts/benchmark.py --numpy-only
+    PYTHONPATH=src python scripts/benchmark.py
+    PYTHONPATH=src python scripts/benchmark.py --onnx-only
+    PYTHONPATH=src python scripts/benchmark.py --torch-only
 """
 
 import argparse
 import gc
 import time
-import statistics
 import sys
 
-# Test sentences
-TEST_SENTENCES = {
-    'ru': [
-        "Привет, как дела?",
-        "Москва столица России.",
-        "Меня зовут Лева Королев.",
-        "Я уже готов открыть все ваши замки любой сложности!",
-        "Древний замок стоит на горе.",
-    ],
-    'ukr': [
-        "Привіт, як справи?",
-        "Київ столиця України.",
-        "Добрий день, як ваші справи?",
-        "Львів дуже гарне місто.",
-        "Дякую за допомогу.",
-    ],
-    'bel': [
-        "Добры дзень, як справы?",
-        "Мінск сталіца Беларусі.",
-        "Дзякуй вельмі за дапамогу.",
-        "Гродна старажытны горад.",
-        "Віцебск на Дзвіне.",
-    ],
-}
+# Test data
+TEST_SENTENCES_100 = [
+    "Привет, как дела?",
+    "Москва столица России.",
+    "Меня зовут Лева Королев.",
+    "Я уже готов открыть все ваши замки любой сложности!",
+    "Древний замок стоит на горе.",
+] * 20  # 100 sentences
 
-WARMUP_ITERATIONS = 50
-BENCHMARK_ITERATIONS = 500
+# Sentence with 7 homographs for BERT-heavy benchmark
+HOMO_SENTENCE = 'Он готов идти дома, потом стоит там, но тому человеку уже надо уже было идти.'
+
+N_WARMUP = 10
+N_RUNS = 50
 
 
-def benchmark_torch(lang, use_homosolver=True):
-    """Benchmark PyTorch implementation."""
-    from silero_stress._torch_impl import TorchAccentorRu, TorchAccentorUkrBel
+def detect_onnx_devices():
+    """Detect available ONNX execution providers and map to device names."""
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        return []
 
-    # Load
+    provider_map = {
+        'CPUExecutionProvider': 'cpu',
+        'CUDAExecutionProvider': 'cuda',
+        'TensorrtExecutionProvider': 'tensorrt',
+        'ROCMExecutionProvider': 'rocm',
+        'OpenVINOExecutionProvider': 'openvino',
+        'CoreMLExecutionProvider': 'coreml',
+        'DmlExecutionProvider': 'directml',
+    }
+
+    # Order: CPU first (baseline), then accelerators
+    preferred_order = ['cpu', 'cuda', 'rocm', 'tensorrt', 'openvino', 'coreml', 'directml']
+
+    available = ort.get_available_providers()
+    detected = set()
+    for provider in available:
+        if provider in provider_map:
+            detected.add(provider_map[provider])
+
+    # Return in preferred order
+    return [d for d in preferred_order if d in detected]
+
+
+def detect_torch_devices():
+    """Detect available PyTorch devices."""
+    try:
+        import torch
+    except ImportError:
+        return []
+
+    devices = ['cpu']
+
+    if torch.cuda.is_available():
+        devices.append('cuda')
+
+    # ROCm uses the same cuda API in PyTorch
+    # MPS for Apple Silicon
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        devices.append('mps')
+
+    return devices
+
+
+def benchmark_backend(backend, device, sentences, homo_sentence):
+    """Benchmark a single backend+device combination.
+
+    Args:
+        backend: 'torch' or 'onnx'
+        device: device string (cpu, cuda, tensorrt, etc.)
+        sentences: list of sentences for throughput test
+        homo_sentence: single sentence with many homographs
+
+    Returns:
+        dict with timing results
+    """
+    # Load model
     load_start = time.perf_counter()
-    if lang == 'ru':
-        acc = TorchAccentorRu(use_homosolver=use_homosolver, device='cpu')
-    else:
-        acc = TorchAccentorUkrBel(lang)
-    load_time = time.perf_counter() - load_start
 
-    sentences = TEST_SENTENCES[lang]
+    if backend == 'torch':
+        from silero_stress._torch_impl import TorchAccentorRu
+        acc = TorchAccentorRu(device=device)
+    else:
+        from silero_stress._impl import AccentorRu
+        acc = AccentorRu(device=device)
+
+    load_time = (time.perf_counter() - load_start) * 1000
 
     # Warmup
-    for _ in range(WARMUP_ITERATIONS):
-        for sent in sentences:
-            acc(sent)
+    for s in sentences[:N_WARMUP]:
+        acc(s)
+    acc(homo_sentence)
 
-    # Benchmark
+    # Benchmark: 100 sentences
     gc.collect()
-    times = []
-    for _ in range(BENCHMARK_ITERATIONS):
-        start = time.perf_counter()
-        for sent in sentences:
-            acc(sent)
-        times.append(time.perf_counter() - start)
+    start = time.perf_counter()
+    for _ in range(N_RUNS):
+        for s in sentences:
+            acc(s)
+    sentences_time = (time.perf_counter() - start) * 1000 / N_RUNS
+
+    # Benchmark: homograph-heavy sentence
+    gc.collect()
+    start = time.perf_counter()
+    for _ in range(N_RUNS * 2):
+        acc(homo_sentence)
+    homo_time = (time.perf_counter() - start) * 1000 / (N_RUNS * 2)
 
     return {
-        'load_time_ms': load_time * 1000,
-        'batch_mean_ms': statistics.mean(times) * 1000,
-        'batch_std_ms': statistics.stdev(times) * 1000,
-        'per_sentence_ms': statistics.mean(times) * 1000 / len(sentences),
-        'p50_ms': statistics.median(times) * 1000,
-        'p95_ms': sorted(times)[int(0.95 * len(times))] * 1000,
-        'p99_ms': sorted(times)[int(0.99 * len(times))] * 1000,
-        'min_ms': min(times) * 1000,
-        'max_ms': max(times) * 1000,
+        'load_ms': load_time,
+        'sentences_100_ms': sentences_time,
+        'homo_7_ms': homo_time,
     }
 
 
-def benchmark_numpy(lang, use_homosolver=True):
-    """Benchmark NumPy/ONNX implementation."""
-    from silero_stress._impl import AccentorRu, AccentorUkrBel
+def print_results(results, baseline_key=None):
+    """Print benchmark results table."""
+    if not results:
+        print("No results to display.")
+        return
 
-    # Load
-    load_start = time.perf_counter()
-    if lang == 'ru':
-        acc = AccentorRu(use_homosolver=use_homosolver, device='cpu')
-    else:
-        acc = AccentorUkrBel(lang)
-    load_time = time.perf_counter() - load_start
+    # Find baseline for speedup calculation
+    if baseline_key is None:
+        # Prefer onnx_cpu, fallback to torch_cpu, then first available
+        for key in ['onnx_cpu', 'torch_cpu']:
+            if key in results:
+                baseline_key = key
+                break
+        if baseline_key is None:
+            baseline_key = list(results.keys())[0]
 
-    sentences = TEST_SENTENCES[lang]
+    baseline = results.get(baseline_key, {})
+    baseline_sent = baseline.get('sentences_100_ms', 1)
+    baseline_homo = baseline.get('homo_7_ms', 1)
 
-    # Warmup
-    for _ in range(WARMUP_ITERATIONS):
-        for sent in sentences:
-            acc(sent)
+    print(f"\n| Backend        | Load    | 100 sentences    | 1 sent (7 homo)  |")
+    print(f"|----------------|---------|------------------|------------------|")
 
-    # Benchmark
-    gc.collect()
-    times = []
-    for _ in range(BENCHMARK_ITERATIONS):
-        start = time.perf_counter()
-        for sent in sentences:
-            acc(sent)
-        times.append(time.perf_counter() - start)
+    for name, data in results.items():
+        sent_speedup = baseline_sent / data['sentences_100_ms'] if data['sentences_100_ms'] > 0 else 0
+        homo_speedup = baseline_homo / data['homo_7_ms'] if data['homo_7_ms'] > 0 else 0
 
-    return {
-        'load_time_ms': load_time * 1000,
-        'batch_mean_ms': statistics.mean(times) * 1000,
-        'batch_std_ms': statistics.stdev(times) * 1000,
-        'per_sentence_ms': statistics.mean(times) * 1000 / len(sentences),
-        'p50_ms': statistics.median(times) * 1000,
-        'p95_ms': sorted(times)[int(0.95 * len(times))] * 1000,
-        'p99_ms': sorted(times)[int(0.99 * len(times))] * 1000,
-        'min_ms': min(times) * 1000,
-        'max_ms': max(times) * 1000,
-    }
-
-
-def print_results(lang, torch_results, numpy_results):
-    """Print comparison table."""
-    print(f"\n{'='*70}")
-    print(f"BENCHMARK: {lang.upper()}")
-    print(f"{'='*70}")
-    print(f"Sentences per batch: {len(TEST_SENTENCES[lang])}")
-    print(f"Warmup: {WARMUP_ITERATIONS}, Iterations: {BENCHMARK_ITERATIONS}")
-
-    if torch_results:
-        print(f"\n[PyTorch]")
-        print(f"  Load time:      {torch_results['load_time_ms']:8.1f}ms")
-        print(f"  Per batch:      {torch_results['batch_mean_ms']:8.2f}ms ± {torch_results['batch_std_ms']:.2f}ms")
-        print(f"  Per sentence:   {torch_results['per_sentence_ms']:8.3f}ms")
-        print(f"  P50/P95/P99:    {torch_results['p50_ms']:.2f} / {torch_results['p95_ms']:.2f} / {torch_results['p99_ms']:.2f}ms")
-
-    print(f"\n[NumPy/ONNX]")
-    print(f"  Load time:      {numpy_results['load_time_ms']:8.1f}ms")
-    print(f"  Per batch:      {numpy_results['batch_mean_ms']:8.2f}ms ± {numpy_results['batch_std_ms']:.2f}ms")
-    print(f"  Per sentence:   {numpy_results['per_sentence_ms']:8.3f}ms")
-    print(f"  P50/P95/P99:    {numpy_results['p50_ms']:.2f} / {numpy_results['p95_ms']:.2f} / {numpy_results['p99_ms']:.2f}ms")
-
-    if torch_results:
-        speedup = torch_results['per_sentence_ms'] / numpy_results['per_sentence_ms']
-        print(f"\n[Speedup]")
-        print(f"  NumPy is {speedup:.1f}x faster per sentence")
+        if name == baseline_key:
+            print(f"| {name:14s} | {data['load_ms']:5.0f}ms | {data['sentences_100_ms']:6.1f}ms          | {data['homo_7_ms']:6.2f}ms          |")
+        else:
+            print(f"| {name:14s} | {data['load_ms']:5.0f}ms | {data['sentences_100_ms']:6.1f}ms ({sent_speedup:4.1f}x)  | {data['homo_7_ms']:6.2f}ms ({homo_speedup:4.1f}x)  |")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Benchmark silero-stress implementations')
-    parser.add_argument('--numpy-only', action='store_true', help='Only benchmark NumPy (no torch required)')
-    parser.add_argument('--lang', choices=['ru', 'ukr', 'bel', 'all'], default='all', help='Language to benchmark')
-    parser.add_argument('--no-homosolver', action='store_true', help='Disable homograph solver for RU')
+    parser = argparse.ArgumentParser(description='Benchmark silero-stress')
+    parser.add_argument('--onnx-only', action='store_true', help='Only benchmark ONNX backends')
+    parser.add_argument('--torch-only', action='store_true', help='Only benchmark PyTorch backends')
+    parser.add_argument('--devices', '-d', default=None,
+                        help='Override auto-detection with specific devices (e.g., cpu,cuda)')
     args = parser.parse_args()
 
-    languages = ['ru', 'ukr', 'bel'] if args.lang == 'all' else [args.lang]
-    use_homosolver = not args.no_homosolver
-
-    print("="*70)
+    print("=" * 70)
     print("SILERO-STRESS BENCHMARK")
-    print("="*70)
+    print("=" * 70)
 
-    has_torch = False
-    if not args.numpy_only:
-        try:
-            import torch
-            torch.set_num_threads(1)
-            has_torch = True
-            print(f"PyTorch: {torch.__version__} (threads=1)")
-        except ImportError:
-            print("PyTorch: not available (use --numpy-only)")
+    # Detect available backends
+    onnx_devices = [] if args.torch_only else detect_onnx_devices()
+    torch_devices = [] if args.onnx_only else detect_torch_devices()
+
+    # Override with manual device list if specified
+    if args.devices:
+        manual_devices = [d.strip().lower() for d in args.devices.split(',')]
+        if not args.torch_only:
+            onnx_devices = [d for d in manual_devices if d in detect_onnx_devices()]
+        if not args.onnx_only:
+            torch_devices = [d for d in manual_devices if d in detect_torch_devices()]
+
+    # Print detected backends
+    print(f"\nONNX devices:   {onnx_devices if onnx_devices else 'none'}")
+    print(f"PyTorch devices: {torch_devices if torch_devices else 'none'}")
+
+    if not onnx_devices and not torch_devices:
+        print("\nNo backends available!")
+        return 1
+
+    # Print versions
+    try:
+        import onnxruntime as ort
+        print(f"\nONNX Runtime: {ort.__version__}")
+        print(f"  Providers: {ort.get_available_providers()}")
+    except ImportError:
+        pass
+
+    try:
+        import torch
+        torch.set_num_threads(1)
+        print(f"PyTorch: {torch.__version__} (threads=1)")
+        if torch.cuda.is_available():
+            print(f"  CUDA: {torch.version.cuda}, Device: {torch.cuda.get_device_name(0)}")
+    except ImportError:
+        pass
 
     import numpy as np
     print(f"NumPy: {np.__version__}")
 
-    try:
-        import onnxruntime as ort
-        print(f"ONNX Runtime: {ort.__version__}")
-    except ImportError:
-        print("ONNX Runtime: not available")
+    # Run benchmarks
+    results = {}
 
-    results_summary = []
+    print(f"\nBenchmarking (warmup={N_WARMUP}, runs={N_RUNS})...")
 
-    for lang in languages:
-        torch_results = None
-        if has_torch:
-            print(f"\nBenchmarking PyTorch ({lang})...")
-            torch_results = benchmark_torch(lang, use_homosolver=(lang == 'ru' and use_homosolver))
+    for device in torch_devices:
+        name = f"torch_{device}"
+        print(f"  {name}...", end=" ", flush=True)
+        try:
+            results[name] = benchmark_backend('torch', device, TEST_SENTENCES_100, HOMO_SENTENCE)
+            print("done")
+        except Exception as e:
+            print(f"FAILED: {e}")
 
-        print(f"Benchmarking NumPy ({lang})...")
-        numpy_results = benchmark_numpy(lang, use_homosolver=(lang == 'ru' and use_homosolver))
+    for device in onnx_devices:
+        name = f"onnx_{device}"
+        print(f"  {name}...", end=" ", flush=True)
+        try:
+            results[name] = benchmark_backend('onnx', device, TEST_SENTENCES_100, HOMO_SENTENCE)
+            print("done")
+        except Exception as e:
+            print(f"FAILED: {e}")
 
-        print_results(lang, torch_results, numpy_results)
+    # Print results
+    print("\n" + "=" * 70)
+    print("RESULTS")
+    print("=" * 70)
+    print_results(results)
 
-        if torch_results:
-            speedup = torch_results['per_sentence_ms'] / numpy_results['per_sentence_ms']
-            results_summary.append({
-                'lang': lang,
-                'torch_ms': torch_results['per_sentence_ms'],
-                'numpy_ms': numpy_results['per_sentence_ms'],
-                'speedup': speedup,
-            })
-        else:
-            results_summary.append({
-                'lang': lang,
-                'numpy_ms': numpy_results['per_sentence_ms'],
-            })
+    # Summary
+    if 'torch_cpu' in results and 'onnx_cpu' in results:
+        speedup = results['torch_cpu']['sentences_100_ms'] / results['onnx_cpu']['sentences_100_ms']
+        print(f"\nONNX CPU is {speedup:.1f}x faster than PyTorch CPU")
 
-    # Summary table
-    print(f"\n{'='*70}")
-    print("SUMMARY")
-    print(f"{'='*70}")
+    if 'onnx_cpu' in results and 'onnx_tensorrt' in results:
+        speedup = results['onnx_cpu']['sentences_100_ms'] / results['onnx_tensorrt']['sentences_100_ms']
+        print(f"ONNX TensorRT is {speedup:.1f}x faster than ONNX CPU")
 
-    if has_torch:
-        print(f"\n| Lang | PyTorch | NumPy | Speedup |")
-        print(f"|------|---------|-------|---------|")
-        for r in results_summary:
-            print(f"| {r['lang'].upper()} | {r['torch_ms']:.2f}ms | {r['numpy_ms']:.2f}ms | **{r['speedup']:.1f}x** |")
-    else:
-        print(f"\n| Lang | NumPy (ms/sentence) |")
-        print(f"|------|---------------------|")
-        for r in results_summary:
-            print(f"| {r['lang'].upper()} | {r['numpy_ms']:.2f}ms |")
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
