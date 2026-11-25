@@ -2,7 +2,7 @@
 
 Reverse-engineered from TorchScript code extracted from `accentor.pt`.
 
-**Verified:** 100% parity with original PyTorch implementation (1924/1924 homographs).
+**Verified:** 100% parity with original PyTorch implementation v1.5 (2208/2208 homographs).
 
 ## Table of Contents
 
@@ -31,9 +31,26 @@ Input sentence
     - Must contain at least one Cyrillic letter (lookahead)
     - Can include '+' character (for already-stressed words)
      ↓
-[2] For each homograph, create marked text:
-    "word" → "... [HOMO] word [/HOMO] ..."
-    Note: Spaces around markers are important!
+    - Candidate if word.lower() is in homodict OR has built-in/user phrases/regexes (v1.5)
+     ↓
+[2] For each candidate, build context (v1.5):
+    left  = clean(text[:start], is_start=True)[-150:]
+    right = clean(text[end:],  is_start=False)[:150]
+    raw_mark  = f"{left} [HOMO] {word.lower()} [/HOMO] {right}".strip()
+    raw_clean = f"{left} {word.lower()} {right}".strip()
+    clean(): drop chars outside [a-zA-Zа-яА-ЯёЁ0-9\s.!?,-], collapse spaces, '--'→' - ',
+             dedupe .!?/commas, no space before / one space after punctuation;
+             left side: lstrip ' .,!?-', capitalize first char, lowercase rest;
+             right side: lowercase all but first char, append '.' if no final .!?
+    Note: spaces around markers are important! The word itself is LOWERCASED.
+    The window crosses sentence boundaries: run the homosolver on the full text,
+    never per sentence.
+     ↓
+[2b] Overrides, first match wins (network skipped):
+    1. user regexes  (load_regex_dict)   searched in raw_clean
+    2. user phrases  (load_phrases_dict) searched in raw_mark
+    3. built-in phrases (1,477 words)    searched in raw_mark
+    No override and word not in homodict → word left untouched
      ↓
 [3] Tokenize with SimpleBertTokenizer:
     - BasicTokenizer: split on whitespace, handle punctuation, preserve [HOMO]/[/HOMO]
@@ -165,7 +182,9 @@ The `word_embeddings.weight` is stored as **int8** and must be **DEQUANTIZED** b
 # After dequantization, weights are float32 and used normally
 ```
 
-**Important:** The original PyTorch model (silero-stress 1.4) applies this dequantization
+**Important:** scale/zero_point change between releases (v1.5: scale=0.01908,
+zero_point=-9.678); always read them from the model, never hardcode.
+The original PyTorch model applies this dequantization
 implicitly. Our torch wrapper (`_torch_impl.py`) and ONNX export must do it explicitly.
 
 ## BertEncoder (3 layers)
@@ -626,7 +645,7 @@ if (n_vowels > 1 or stress_single_vowel) and put_stress:
 Tokenizer encoding:     100% match
 BERT hidden states:     max_diff < 1e-4
 Classifier outputs:     max_diff < 1e-5
-Homograph predictions:  1924/1924 (100%)
+Homograph predictions:  2208/2208 (100%, v1.5)
 Full accentor output:   100% match
 ```
 
@@ -641,7 +660,8 @@ src/silero_stress/
     ├── homo_clf_ru.onnx.gz   # Classifier
     ├── vocab_ru.json.gz      # 83,830 tokens
     ├── special_tokens_ru.json.gz
-    ├── homodict_ru.json.gz   # 1,924 homographs
+    ├── homodict_ru.json.gz   # 2,208 homographs
+    ├── phrases_ru.json.gz    # built-in phrase regexes {word: pattern} (v1.5)
     └── yohomodict_ru.json.gz # ё-homographs
 ```
 
@@ -655,9 +675,9 @@ Based on [Habr article](https://habr.com/ru/articles/955130/) and GitHub issues.
 
 | Metric | Value |
 |--------|-------|
-| Active homographs | 1,924 (from 2,157 candidates) |
+| Active homographs | 2,208 in v1.5 (1,924 in v1.4) |
 | Total variants | ~5,630 |
-| Training sentences | 122 million |
+| Training sentences | ~200 million (v1.5; 122M in v1.4) |
 | Median sentences/homograph | 11,000 |
 | Median sentences/variant | 3,200 |
 | Dictionary size | 4.1M word forms |
@@ -666,7 +686,9 @@ Based on [Habr article](https://habr.com/ru/articles/955130/) and GitHub issues.
 
 | Model | Precision | Recall | F1 | Word Acc |
 |-------|-----------|--------|-----|----------|
-| silero-stress (public) | 0.84 | 0.90 | 0.85 | 0.92 |
+| silero-stress v1.5 | - | - | 0.92 | 0.94 |
+| v1.5 on our labeled corpus (both readings forced) | - | - | - | 0.796 |
+| silero-stress v1.4 | 0.84 | 0.90 | 0.85 | 0.92 |
 | Naive baseline (most frequent) | - | - | - | 0.85 |
 
 **Important:** Naive baseline achieves 85% by always selecting the most frequent variant.
@@ -689,12 +711,20 @@ These behaviors exist in the original PyTorch implementation:
    ```
    Homodict contains lowercase entries; case-sensitive lookup affects ё.
 
-3. **Rare homographs excluded** - Variants requiring >95% precision were removed
+3. **"стоит" in price context (v1.5 model error)**
+   ```python
+   acc("Этот телефон стоит десять тысяч.")         # "... сто+ит ..." (wrong, logit +4.3)
+   acc("Телефон стоит десять тысяч рублей.")       # "... ст+оит ..." (correct)
+   ```
+   No built-in phrase covers prices. Work around with `load_regex_dict()`
+   (rule matching "стоит" + numeral/currency → "ст+оит").
+
+4. **Rare homographs excluded** - Variants requiring >95% precision were removed
    to avoid brittleness. ~233 candidates were excluded.
 
 ### Verified Working
 
-These were reported as issues but work correctly in v1.4:
+These were reported as issues but work correctly in v1.4+:
 
 | Feature | Status | Example |
 |---------|--------|---------|

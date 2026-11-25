@@ -64,16 +64,17 @@ Files are organized by language in `src/silero_stress/data/<lang>/`:
 
 | File | Size | Description |
 |------|------|-------------|
-| `bert_ru.onnx.gz` | 30MB | BERT encoder for homograph disambiguation (optional) |
+| `bert_ru.onnx.gz` | 29MB | BERT encoder for homograph disambiguation (optional) |
 | `homo_clf_ru.onnx.gz` | 581KB | Homograph binary classifier (requires BERT) |
 | `embedding_ru.npz` | 1.9MB | N-gram embeddings (126K × 16, float32) |
 | `stress_clf_ru_weights.npz` | 74KB | Stress classifier MLP weights |
 | `yo_clf_ru_weights.npz` | 73KB | Yo (ё) classifier MLP weights |
 | `ngram_dict_ru.json.gz` | 708KB | N-gram to index mapping |
-| `exceptions_ru.json.gz` | 112KB | 16,976 exception words |
+| `exceptions_ru.json.gz` | 123KB | 19,660 exception words |
 | `vocab_ru.json.gz` | 601KB | BERT vocabulary (83K tokens) |
-| `homodict_ru.json.gz` | 26KB | 1,924 homographs |
-| `yohomodict_ru.json.gz` | 2.4KB | 164 yo-homographs |
+| `homodict_ru.json.gz` | 29KB | 2,208 homographs |
+| `phrases_ru.json.gz` | 265KB | Built-in phrase overrides for 1,477 words (pre-compiled regex strings) |
+| `yohomodict_ru.json.gz` | 2.6KB | 181 yo-homographs |
 | `special_tokens_ru.json.gz` | 113B | BERT special token IDs |
 
 *Note: NPZ files are uncompressed (they use internal zip). BERT files are only needed for homograph disambiguation.*
@@ -120,6 +121,12 @@ print(ukr('Привіт, як справи?'))
 bel = load_accentor('bel')
 print(bel('Добры дзень!'))
 # Output: Д+обры дз+ень!
+
+# v1.5: user overrides for the homograph solver (same JSON formats as upstream,
+# see src/silero_stress/data/regex_examples/). Works with both backends.
+ru.load_phrases_dict('phrases.json')   # {"замок": {"высокий замок": "з+амок"}}
+ru.load_regex_dict('regex.json')       # {"все": {"вс+е": ["(\\bвс)(е|ё)\\b\\s\\b(до)\\b..."]}}
+# equivalent to upstream: ru.homosolver.load_phrases_dict(...)
 
 # With GPU acceleration (requires onnxruntime-gpu)
 ru_gpu = load_accentor('ru', use_homosolver=True, device='tensorrt')
@@ -376,6 +383,10 @@ The benchmark:
 
 ### Results (Russian with Homograph Solver)
 
+*Measured on v1.4. Re-run on v1.5 (CPU only): torch_cpu 419ms, onnx_cpu 290ms per 100
+sentences (1.4x). v1.5 builds a separate cleaned context per homograph, which costs some
+throughput; GPU rows not re-measured.*
+
 | Backend        | Load    | 100 sentences    | 1 sent (7 homo)  |
 |----------------|---------|------------------|------------------|
 | torch_cpu      |   672ms |  460.6ms (0.5x)  |  20.23ms (0.4x)  |
@@ -389,6 +400,68 @@ The benchmark:
 - ONNX TensorRT is **1.9x faster** than ONNX CPU for throughput
 - ONNX TensorRT is **3.4x faster** than ONNX CPU for homograph-heavy sentences
 - TensorRT has higher load time due to engine compilation (cached after first run)
+
+## Homograph Solver (v1.5 semantics)
+
+Ported 1:1 from upstream `models/homosolver.py` v1.5 (see ARCHITECTURE.md, HomoSolver Pipeline):
+
+- Context is cleaned and cut to a 300-char window (150 left / 150 right); the
+  homograph itself is lowercased in the BERT input.
+- Override order: user regexes → user phrases → built-in phrases → BERT.
+- The homosolver runs on the **full input text** before sentence splitting: the
+  context window crosses sentence boundaries, so per-sentence processing would
+  change predictions. `batch()` treats each item as an independent text and
+  resolves all their homographs in a single BERT call.
+- Built-in phrases are only shipped compiled inside `accentor.pt` (no phrases.json),
+  so `export_ru.py` stores `{word: pattern_string}`; patterns are compiled lazily
+  on first use (eager compile of all 1,477 costs ~2.5s at load).
+- Tagging is linear in text length (upstream: quadratic due to a `.*` lookahead and
+  re-cleaning the whole prefix per homograph; 16K chars: 2.8s → 0.23s), output identical.
+- `put_stress_homo=False` / `put_yo_homo=False` follow upstream's `skip_stress_words` /
+  `skip_yo_words`: homographs are left to neither the homosolver nor the n-gram model.
+  Exceptions-dict words and 1-syllable words are still stressed, except words already
+  containing ё, which are left untouched (same order of checks as upstream).
+- BERT padding is not masked (upstream passes no attention mask), so a homograph's
+  prediction can depend on the other rows in the same batch. On the labeled corpus,
+  whole-text vs unpadded runs differ on ~1.9% of homographs and gold splits ~50/50:
+  noise, not degradation. Reproduced as-is for parity.
+
+## N-gram Confidence Threshold
+
+As in upstream, an n-gram stress / ё prediction is applied only if its softmax
+probability is > 0.5; otherwise the word is left as is (1-syllable words are always
+stressed). Example: "к сторожу" (p=0.40) stays unstressed. Applies to RU, UKR and BEL.
+
+## Deliberate Deviations from Upstream
+
+Where upstream's output is wrong, the NumPy backend differs on purpose:
+
+| Case | Upstream | NumPy |
+|------|----------|-------|
+| ё placed on an unstressed vowel (n-gram ё check) | `отм+енён`, `зап+оём` | `отм+енен`, `зап+оем` |
+| Exception-dict word glued to punctuation (positions applied to the raw token) | `«Бел+ёе`, `«+Деньги`, `«Те+бе` | `«Бель+ё`, `«Д+еньги`, `«Теб+е` |
+
+Also, the exceptions dict never adds ё to a word that is already stressed (by the
+homosolver or the user), so the homosolver's choice stands: `кр+естные ходы`,
+`всех родн+ей`. Upstream behaves the same in practice (its check is off by one and
+does not fire).
+
+## Labeled Homograph Corpus
+
+`tests/data/homograph_corpus_annotated.txt.gz`: one ~262K-char coherent text containing
+all 2,208 homographs, 5,787 stress-labeled occurrences (two independent annotation
+passes + blind tie-break; ambiguous cases unlabeled). See `tests/data/corpus_build/README.md`.
+
+| | Accuracy |
+|---|---|
+| Upstream torch (whole text) | 79.5% |
+| NumPy (whole text) | 79.6% |
+
+The text deliberately uses both readings of every word, so accuracy is lower than on
+natural text. Weakest areas: perfective/imperfective pairs (`в+ырезал` / `вырез+ал`),
+`все` / `всё`. `tests/test_homograph_corpus_e2e.py` enforces bit-exact upstream parity on
+the whole text (except the deviations above) and an accuracy floor; run
+`scripts/eval_homograph_corpus.py` for a full report.
 
 ## Limitations
 
