@@ -24,13 +24,26 @@ def merge_onnx_external_data():
 
     for onnx_path in EXPORT_DIR.glob('*.onnx'):
         data_path = Path(f'{onnx_path}.data')
+        print(f"  Finalizing {onnx_path.name} (embed weights, name dynamic dims)...")
+        model = onnx.load(str(onnx_path), load_external_data=True)
+        _name_dynamic_dims(model)
+        onnx.save(model, str(onnx_path), save_as_external_data=False)
         if data_path.exists():
-            print(f"  Merging {onnx_path.name} external data...")
-            model = onnx.load(str(onnx_path), load_external_data=True)
-            onnx.save(model, str(onnx_path), save_as_external_data=False)
             data_path.unlink()
-            size_mb = onnx_path.stat().st_size / 1024 / 1024
-            print(f"    Done. Size: {size_mb:.1f} MB")
+        size_mb = onnx_path.stat().st_size / 1024 / 1024
+        print(f"    Done. Size: {size_mb:.1f} MB")
+
+
+def _name_dynamic_dims(model):
+    """Rename symbolic IO dims: dim 0 -> 'batch', dim 1 -> 'seq_len'.
+
+    The dynamo exporter emits anonymous symbols (s70, s72...); named dims keep the IO
+    signature readable and stable across re-exports. Static dims are left untouched.
+    """
+    for vi in list(model.graph.input) + list(model.graph.output):
+        for dim, name in zip(vi.type.tensor_type.shape.dim, ('batch', 'seq_len')):
+            if dim.dim_param:
+                dim.dim_param = name
 
 
 def gzip_files(remove_originals=True):
@@ -148,7 +161,11 @@ def export_onnx():
         state_dict[tf_name] = data
 
     # Load into transformers model
-    tf_bert.load_state_dict(state_dict, strict=False)
+    missing, unexpected = tf_bert.load_state_dict(state_dict, strict=False)
+    # strict=False only to tolerate non-parameter buffers; any real weight mismatch is fatal
+    missing = [k for k in missing if not k.endswith('position_ids')]
+    if missing or unexpected:
+        raise RuntimeError(f"BERT weight mapping mismatch: missing={missing} unexpected={unexpected}")
     tf_bert.eval()
 
     # Test with single input first
@@ -252,7 +269,8 @@ def export_classifier_onnx():
             'embedding': {0: 'batch'},
             'logit': {0: 'batch'}
         },
-        opset_version=14
+        opset_version=14,
+        dynamo=False,  # dynamo exporter ignores dynamic_axes here and fixes logit to [1, 1]
     )
     print(f"Saved to {onnx_path}")
 
@@ -276,6 +294,10 @@ def test_full_pipeline():
     import onnxruntime as ort
 
     acc = load_model()
+    # Dequantize word embeddings, as TorchAccentorRu / upstream load_accentor do
+    bert = acc.homosolver.model.bert
+    qw = bert.embeddings.word_embeddings.weight.data.clone()
+    bert.embeddings.word_embeddings.weight.data = bert.scale * (qw - bert.zero_point)
     tok = acc.homosolver.tokenizer
 
     bert_path = EXPORT_DIR / 'bert_ru.onnx'
@@ -291,7 +313,7 @@ def test_full_pipeline():
     # Test homographs
     homodict = acc.homosolver.homodict
 
-    test_words = ['готов', 'дома', 'тому', 'потом', 'стоит']
+    test_words = ['готов', 'дома', 'тому', 'потом', 'стоит', 'замок', 'мука', 'атлас', 'белки']
     matches = 0
     total = 0
 
@@ -302,10 +324,13 @@ def test_full_pipeline():
             continue
 
         sent = f'Он {word}.'
-        marked = f'Он [HOMO] {word} [/HOMO] .'
+        # Build the BERT input exactly as the packaged homosolver does (v1.5 cleans the
+        # context, windows it and lowercases the word; tuple index 4 is raw_mark in v1.4+)
+        tagged = [t for t in acc.homosolver._find_and_tag_homos(sent) if t[4] is not None]
+        marked = tagged[0][4]
 
         # PyTorch prediction
-        pt_result = acc.homosolver(sent, homodict)
+        pt_result = acc.homosolver(sent)
 
         # ONNX prediction
         ids = tok.encode(marked)

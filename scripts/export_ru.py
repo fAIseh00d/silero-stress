@@ -7,6 +7,7 @@ Components:
 2. Homosolver (BERT) - homograph disambiguation
 """
 
+import re
 import torch
 import json
 import gzip
@@ -180,6 +181,23 @@ def export_homosolver_component(accentor):
         json.dump(yohomodict, f, ensure_ascii=False, indent=2)
     print(f"  Saved to {yohomodict_path}")
 
+    # 2b. Export built-in phrase overrides (v1.5+).
+    # The package only ships them pre-compiled (phrases.json itself is not included),
+    # so we store {word: pattern_string}; _impl.py compiles them with re.IGNORECASE.
+    phrases = {}
+    if hasattr(hs, 'compiled_phrases'):
+        print("Extracting built-in phrases...")
+        for word, compiled in hs.compiled_phrases.items():
+            assert compiled.flags & re.IGNORECASE, word
+            phrases[word] = compiled.pattern
+        print(f"  Found phrases for {len(phrases)} words")
+        phrases_path = ru_dir / "phrases_ru.json"
+        with open(phrases_path, 'w', encoding='utf-8') as f:
+            json.dump(phrases, f, ensure_ascii=False)
+        print(f"  Saved to {phrases_path}")
+    else:
+        print("No built-in phrases in this model version (pre-v1.5)")
+
     # 3. Export tokenizer vocab
     print("Extracting tokenizer vocab...")
     tok = hs.tokenizer
@@ -213,6 +231,7 @@ def export_homosolver_component(accentor):
     return {
         'homodict': homodict,
         'yohomodict': yohomodict,
+        'phrases': phrases,
         'vocab': vocab,
         'special_tokens': special_tokens,
     }
