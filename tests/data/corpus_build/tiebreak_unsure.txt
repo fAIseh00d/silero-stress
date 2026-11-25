@@ -1,0 +1,45 @@
+86 все/всё: "дороги все/всё те же" both plausible
+146 вырезался: pun context, aspect unclear
+133 всыпать aspect
+164 вырезалось: aspect unclear
+167 горьки: both stresses normative
+170 Гостя: odd syntax
+207 жемчуга after таких: grammar mixed
+202 спалось: both normative
+260 засыпали траншею: aspect ambiguous
+295 колки (short adj): both stresses normative
+296 комплексное число: math tradition кОмплексное vs norm комплЕксное
+297 same
+228 длинноты gen sg vs pl
+314 красны: both stresses normative
+315 same
+324 кубы: ку́бы vs кубы́ (geometric)
+303 комплексных числах (math)
+407 обегал озеро за десять минут: circle vs cover
+389 нарезали резьбу: aspect
+458 все/всё отбегали: both plausible
+524 пересыпались: aspect
+525 пересыпала яблоки: aspect
+554 оплатите: future-request vs imperative
+571 поделитесь: future-request vs imperative
+572 подпали траву: ungrammatical context (подпалили intended)
+538 из печи: gen пЕчи vs common печИ
+610 попросите: imperative vs future-request
+669 Проклятая земля: participle про́клятая vs adj прокля́тая
+670 same as 669
+671 same as 669
+672 same as 669
+676 простынь gen pl: про́стынь vs просты́нь both attested
+689 проклятый воевода: participle vs adj
+705 проклятому злодею: participle vs adj
+711 прорезать тропинки: aspect
+745 резки: both stresses normative
+760 рядится (dress up): ря́дится vs ряди́тся
+796 скучны: both normative
+797 same
+800 слилось: both normative
+811 сорвались: both normative
+813 сорвалось: both normative
+823 стары: both normative
+861 тихи: both normative
+901 ходу (partitive): хо́ду vs ходу́

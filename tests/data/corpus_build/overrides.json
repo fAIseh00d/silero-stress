@@ -1,0 +1,20 @@
+[
+  {
+    "word": "перечеркнут",
+    "context": "наши планы перечеркнут",
+    "label": null,
+    "note": "ambiguous: future active перечеркн+ут vs passive переч+ёркнут (native-speaker review)"
+  },
+  {
+    "word": "волокна",
+    "context": "мышечные волокна плохо",
+    "label": "вол+окна",
+    "note": "nominative plural; both annotators had волокн+а (review)"
+  },
+  {
+    "word": "сокол",
+    "context": "набрал раствор на сокол",
+    "label": null,
+    "note": "plasterer's hawk: stress of this sense unverified"
+  }
+]
