@@ -103,6 +103,8 @@ class TorchAccentorRu:
             sentence,
             put_stress=put_stress,
             put_yo=put_yo,
+            put_stress_homo=put_stress_homo,
+            put_yo_homo=put_yo_homo,
             stress_single_vowel=stress_single_vowel
         )
 

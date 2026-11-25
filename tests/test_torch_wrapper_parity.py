@@ -557,6 +557,23 @@ class TestRussianHomosolverV15(unittest.TestCase):
         texts = ['Высокий замок стоял.', 'Он взломал замок.', 'Страшная мука.', 'Без омографов тут.']
         self.assertEqual(self.numpy_acc.batch(texts), [self.torch_acc(t) for t in texts])
 
+    def test_flag_matrix(self):
+        """All put_stress/put_yo/put_*_homo/stress_single_vowel combinations match upstream,
+        incl. upstream's skip_*_words semantics when put_*_homo=False."""
+        import itertools
+        texts = [
+            'Высокий замок стоял, и все было готово. Мука в мешке.',
+            'Все идет хорошо, белки прыгали около дома.',
+            'Всё ещё живём. Её нет, а мёд есть.',
+            'Ты узнаешь все потом, и все это поймешь.',
+        ]
+        for flags in itertools.product([True, False], repeat=5):
+            f = dict(zip(('put_stress', 'put_yo', 'put_stress_homo', 'put_yo_homo', 'stress_single_vowel'), flags))
+            ref = [self.torch_acc(t, **f) for t in texts]
+            with self.subTest(**f):
+                self.assertEqual([self.numpy_acc(t, **f) for t in texts], ref)
+                self.assertEqual(self.numpy_acc.batch(texts, **f), ref)
+
     def test_user_phrases_and_regex(self):
         """load_phrases_dict / load_regex_dict with upstream's example files."""
         from silero_stress._torch_impl import TorchAccentorRu

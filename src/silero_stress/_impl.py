@@ -913,6 +913,11 @@ class AccentorRu(_AccentorBase):
 
         self.vowels = 'аоуыэиеяёю'
 
+        # Used to leave homographs alone when put_stress_homo / put_yo_homo is False
+        # (upstream passes these as skip_stress_words / skip_yo_words to the n-gram accentor)
+        self._homo_words = frozenset(_load_gzip_json('ru', 'homodict_ru.json.gz'))
+        self._yohomo_words = frozenset(_load_gzip_json('ru', 'yohomodict_ru.json.gz'))
+
         if use_homosolver and HAS_ONNX:
             try:
                 self.homosolver = OnnxHomosolver(device=device)
@@ -952,6 +957,26 @@ class AccentorRu(_AccentorBase):
     def device(self):
         """Return current device string."""
         return self._device_str
+
+    def _skip_sets(self, put_stress_homo, put_yo_homo):
+        """Words the n-gram model must not stress / yo-ify (mirrors upstream skip_*_words).
+
+        Exceptions-dict words are still processed, as in upstream.
+        """
+        empty = frozenset()
+        return (empty if put_stress_homo else self._homo_words,
+                empty if put_yo_homo else self._yohomo_words)
+
+    def _skip_stress_word(self, clean, skip_stress):
+        """Mirror upstream's skip_stress_words semantics.
+
+        - word already containing 'ё' (e.g. from the homosolver): skipped outright;
+          upstream checks this before the exceptions dict and the 1-syllable rule
+        - otherwise: skipped only if it has 2+ vowels (1-syllable words are always stressed)
+        """
+        if clean.replace('ё', 'е') not in skip_stress:
+            return False
+        return 'ё' in clean or sum(c in self.vowels for c in clean) > 1
 
     def _predict_stress(self, words, embeddings=None):
         """Predict stress positions. Optionally accepts pre-computed embeddings."""
@@ -1017,7 +1042,8 @@ class AccentorRu(_AccentorBase):
             sentences, seps = parts[0::2], parts[1::2]
             out = self.batch(sentences, put_stress=put_stress, put_yo=put_yo,
                              stress_single_vowel=stress_single_vowel,
-                             put_stress_homo=False, put_yo_homo=False)
+                             put_stress_homo=put_stress_homo, put_yo_homo=put_yo_homo,
+                             _homo_done=True)
             return ''.join(s + sep for s, sep in zip(out, seps + ['']))
 
         # Single sentence path
@@ -1048,6 +1074,8 @@ class AccentorRu(_AccentorBase):
                 clean_tokens.append(clean)
                 needs_processing.append(len(clean) > 0 and should_process)
 
+        skip_stress, skip_yo = self._skip_sets(put_stress_homo, put_yo_homo)
+
         stress_words_to_predict = []
         stress_word_indices = []
         yo_words_to_predict = []
@@ -1062,15 +1090,16 @@ class AccentorRu(_AccentorBase):
 
             if clean in self.exceptions:
                 exc = self.exceptions[clean]
-                if put_stress and not has_stress:
+                if put_stress and not has_stress and not ('ё' in clean and self._skip_stress_word(clean, skip_stress)):
                     exception_stress[i] = exc[0]
                 if put_yo and len(exc) > 1 and exc[1] >= 0:
                     exception_yo[i] = exc[1]
             else:
-                if put_stress and not has_stress:
+                base = clean.replace('ё', 'е')
+                if put_stress and not has_stress and not self._skip_stress_word(clean, skip_stress):
                     stress_words_to_predict.append(clean)
                     stress_word_indices.append(i)
-                if put_yo and 'е' in clean:
+                if put_yo and 'е' in clean and base not in skip_yo:
                     yo_words_to_predict.append(clean)
                     yo_word_indices.append(i)
 
@@ -1185,7 +1214,7 @@ class AccentorRu(_AccentorBase):
         return ''.join(result_tokens)
 
     def batch(self, sentences, put_stress=True, put_yo=True, stress_single_vowel=True,
-              put_stress_homo=True, put_yo_homo=True):
+              put_stress_homo=True, put_yo_homo=True, _homo_done=False):
         """Process multiple sentences in a single batch for better throughput.
 
         Each sentence is an independent text: homographs in all of them are resolved
@@ -1206,7 +1235,7 @@ class AccentorRu(_AccentorBase):
             return []
 
         # Process homographs first (one batched BERT call across all sentences)
-        if self.homosolver and (put_stress_homo or put_yo_homo):
+        if self.homosolver and (put_stress_homo or put_yo_homo) and not _homo_done:
             sentences = self.homosolver.batch(sentences, put_stress_homo, put_yo_homo, stress_single_vowel)
 
         if not put_stress and not put_yo:
@@ -1242,6 +1271,8 @@ class AccentorRu(_AccentorBase):
             all_clean_tokens.append(clean_tokens)
             all_needs_processing.append(needs_processing)
 
+        skip_stress, skip_yo = self._skip_sets(put_stress_homo, put_yo_homo)
+
         # 2. Collect words for stress prediction
         stress_words = []
         stress_locations = []  # (sent_idx, tok_idx)
@@ -1263,15 +1294,16 @@ class AccentorRu(_AccentorBase):
 
                 if clean in self.exceptions:
                     exc = self.exceptions[clean]
-                    if put_stress and not has_stress:
+                    if put_stress and not has_stress and not ('ё' in clean and self._skip_stress_word(clean, skip_stress)):
                         exception_stress[key] = exc[0]
                     if put_yo and len(exc) > 1 and exc[1] >= 0:
                         exception_yo[key] = exc[1]
                 else:
-                    if put_stress and not has_stress:
+                    base = clean.replace('ё', 'е')
+                    if put_stress and not has_stress and not self._skip_stress_word(clean, skip_stress):
                         stress_words.append(clean)
                         stress_locations.append(key)
-                    if put_yo and 'е' in clean:
+                    if put_yo and 'е' in clean and base not in skip_yo:
                         yo_words.append(clean)
                         yo_locations.append(key)
 
