@@ -574,6 +574,16 @@ class TestRussianHomosolverV15(unittest.TestCase):
                 self.assertEqual([self.numpy_acc(t, **f) for t in texts], ref)
                 self.assertEqual(self.numpy_acc.batch(texts, **f), ref)
 
+    def test_upstream_bug_fixes(self):
+        """Deliberate deviations from upstream (upstream output is wrong here)."""
+        n = self.numpy_acc
+        # exception-dict word with leading punctuation: upstream gives "«Бел+ёе" (corrupted)
+        self.assertEqual(n('«Белье замочите.'), '«Бель+ё зам+очите.')
+        self.assertEqual(n('„Белье“'), '„Бель+ё“')
+        self.assertEqual(n.batch(['«Белье замочите.'])[0], '«Бель+ё зам+очите.')
+        # homosolver's ё decision is not overridden by the exceptions dict
+        self.assertIn('Кр+естные ход+ы', n('Крестные ходы шли от храма к храму.'))
+
     def test_low_confidence_left_unstressed(self):
         """Upstream only applies n-gram predictions with softmax p > 0.5."""
         text = 'Максим, вернувшись к сторожу.'

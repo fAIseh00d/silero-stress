@@ -662,6 +662,24 @@ class _AccentorBase:
         x = np.dot(x, weights['6_weight'].T) + weights['6_bias']
         return x
 
+    def _letter_positions(self, word):
+        """Raw indices of the word's letters (what remains in the clean word).
+
+        Exception-dict positions are indices into the CLEAN word; the raw token may carry
+        leading/trailing punctuation («Белье», „Замок) or a '+', so map before indexing.
+        Upstream indexes the raw token directly and shifts/corrupts such words.
+        """
+        nonletter = getattr(self, '_clean_re', None) or self._CLEAN_RE
+        return [i for i, c in enumerate(word) if not nonletter.match(c)]
+
+    def _raw_index(self, word, clean_idx):
+        pos = self._letter_positions(word)
+        return pos[clean_idx] if 0 <= clean_idx < len(pos) else None
+
+    def _clean_stress_index(self, word):
+        """Clean-word index of the letter right after '+'."""
+        return sum(1 for i in self._letter_positions(word) if i < word.index(self.stress_token))
+
     @staticmethod
     def _confident_argmax(logits):
         """argmax, or -1 where softmax confidence <= 0.5.
@@ -682,7 +700,9 @@ class _AccentorBase:
         1-syllable words, which upstream always stresses.
         """
         if is_char_pos:
-            stress_idx = stress_pos
+            stress_idx = self._raw_index(word, stress_pos)
+            if stress_idx is None:
+                return word
         else:
             vowel_ids = [i for i, c in enumerate(word.lower()) if c in self.vowels]
             if not vowel_ids:
@@ -1024,7 +1044,8 @@ class AccentorRu(_AccentorBase):
     def _yo_replace_word(self, word, yo_pos, is_char_pos=False):
         """Replace 'е' with 'ё' at predicted position."""
         if is_char_pos:
-            if yo_pos < 0 or yo_pos >= len(word):
+            yo_pos = self._raw_index(word, yo_pos)  # clean-word index -> raw index
+            if yo_pos is None:
                 return word
             char = word[yo_pos]
             if char == 'е':
@@ -1161,10 +1182,11 @@ class AccentorRu(_AccentorBase):
                     # ё must be stressed - check if pre-existing stress matches yo position
                     has_stress = self.stress_token in raw
                     if has_stress:
-                        stress_marker_idx = raw.lower().index(self.stress_token)
-                        # Only convert if stress is on the same char
-                        if stress_marker_idx == yo_char_pos:
-                            result_tokens[i] = self._yo_replace_word(result_tokens[i], yo_char_pos, is_char_pos=True)
+                        # Pre-stressed (homosolver/user): the stress source already decided ё,
+                        # e.g. homosolver "кр+естные ходы" must not become "кр+ёстные". Upstream's
+                        # check (exc_yo + 1 in '+' positions) is off by one and never fires for a
+                        # stressed ё, so it never converts here either.
+                        pass
                     else:
                         # No pre-existing stress, check if exception stress matches yo
                         if i in exception_stress:
@@ -1201,7 +1223,7 @@ class AccentorRu(_AccentorBase):
                             if stressed_char == 'е':
                                 # The stressed 'е' is at position stress_marker_idx in the original word (without +)
                                 # since clean doesn't have '+', we need to find the char index
-                                actual_stressed_char_idx = stress_marker_idx  # in clean (no +)
+                                actual_stressed_char_idx = self._clean_stress_index(raw)
                                 # Only convert if yo_pred points to this same 'е'
                                 if actual_stressed_char_idx == yo_char_idx:
                                     result_tokens[i] = self._yo_replace_word(result_tokens[i], yo_pos - 1, is_char_pos=False)
@@ -1375,9 +1397,7 @@ class AccentorRu(_AccentorBase):
                         yo_char_pos = exception_yo[key]
                         has_stress = self.stress_token in raw
                         if has_stress:
-                            stress_marker_idx = raw.lower().index(self.stress_token)
-                            if stress_marker_idx == yo_char_pos:
-                                result_tokens[tok_idx] = self._yo_replace_word(result_tokens[tok_idx], yo_char_pos, is_char_pos=True)
+                            pass  # pre-stressed: keep the stress source's ё decision (see single path)
                         elif key in exception_stress:
                             if exception_stress[key] == yo_char_pos:
                                 result_tokens[tok_idx] = self._yo_replace_word(result_tokens[tok_idx], yo_char_pos, is_char_pos=True)
@@ -1402,7 +1422,7 @@ class AccentorRu(_AccentorBase):
                             if stress_marker_idx + 1 < len(raw):
                                 stressed_char = raw[stress_marker_idx + 1].lower()
                                 if stressed_char == 'е':
-                                    actual_stressed_char_idx = stress_marker_idx
+                                    actual_stressed_char_idx = self._clean_stress_index(raw)
                                     if actual_stressed_char_idx == yo_char_idx:
                                         result_tokens[tok_idx] = self._yo_replace_word(result_tokens[tok_idx], yo_pos - 1, is_char_pos=False)
                         else:
