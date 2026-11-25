@@ -40,3 +40,7 @@ export = ["torch>=2.0", "onnx>=1.14", "onnxruntime>=1.16", "onnxscript", "transf
 [project.urls]
 Homepage = "https://github.com/snakers4/silero-stress"
 Issues = "https://github.com/snakers4/silero-stress/issues"
+[tool.hatch.build.targets.sdist]
+core-metadata-version = "2.4"
+[tool.hatch.build.targets.wheel]
+core-metadata-version = "2.4"
