@@ -3,6 +3,7 @@ Pure NumPy implementation of silero-stress accentor.
 NO PyTorch required! ONNX Runtime is optional (only for Russian BERT homograph solver).
 """
 
+import os
 import re
 import io
 import gzip
@@ -263,8 +264,93 @@ def _parse_device(device):
     return device
 
 
+def _capitalize_stress(stressed_word):
+    """'з+амок' -> 'зАмок' (regex group names can't contain '+')."""
+    stress_idx = stressed_word.index('+')
+    return stressed_word[:stress_idx] + stressed_word[stress_idx + 1].capitalize() + stressed_word[stress_idx + 2:]
+
+
+def _decapitalize_stress(stressed_word):
+    """'зАмок' -> 'з+амок' (inverse of _capitalize_stress)."""
+    for idx, char in enumerate(stressed_word):
+        if char.isupper():
+            return stressed_word[:idx] + '+' + stressed_word[idx:].lower()
+
+
+def _compile_phrases(phrases_dict):
+    """Compile {word: {phrase: variant}} into {word: regex}, as upstream v1.5 does.
+
+    Phrases are matched against the [HOMO]-marked context, longest first, and the
+    matching named group (variant with capitalized stressed vowel) gives the answer.
+    """
+    compiled = {}
+    for word, phrases_to_variants in phrases_dict.items():
+        variant_to_phrases = {}
+        for phrase, variant in phrases_to_variants.items():
+            variant_to_phrases.setdefault(variant, []).append(phrase)
+        variant_patterns = []
+        for variant, phrases in variant_to_phrases.items():
+            group_name = _capitalize_stress(variant)
+            sorted_phrases = sorted(phrases, key=len, reverse=True)
+            sorted_phrases = [p.replace(word, f'[HOMO] {word} [/HOMO]').strip() for p in sorted_phrases]
+            joined = '|'.join(map(re.escape, sorted_phrases))
+            variant_patterns.append(rf'(?P<{group_name}>(?<![а-яА-ЯёЁ\-])(?:{joined})(?![а-яА-ЯёЁ\-]))')
+        compiled[word] = re.compile('|'.join(variant_patterns), re.IGNORECASE)
+    return compiled
+
+
+class _LazyRegexDict(dict):
+    """{word: compiled regex} that compiles each pattern on first lookup.
+
+    Compiling all ~1.5K built-in phrase patterns eagerly takes ~2.5s at load time,
+    while a typical text touches only a handful of them.
+    """
+
+    def __init__(self, sources, flags):
+        super().__init__()
+        self._sources = sources
+        self._flags = flags
+
+    def __contains__(self, word):
+        return word in self._sources
+
+    def __missing__(self, word):
+        compiled = self[word] = re.compile(self._sources[word], self._flags)
+        return compiled
+
+    def __len__(self):
+        return len(self._sources)
+
+    def __iter__(self):
+        return iter(self._sources)
+
+    def keys(self):
+        return self._sources.keys()
+
+    def items(self):
+        return ((w, self[w]) for w in self._sources)
+
+
 class OnnxHomosolver:
-    """ONNX-based Russian homograph solver."""
+    """ONNX-based Russian homograph solver (mirrors upstream v1.5 HomoSolver).
+
+    Resolution order for each homograph candidate:
+      1. user regexes   (load_regex_dict)   - matched on the cleaned context
+      2. user phrases   (load_phrases_dict) - matched on the [HOMO]-marked context
+      3. built-in phrases                    - matched on the [HOMO]-marked context
+      4. BERT + classifier (only if the word is in homodict)
+    """
+
+    WINDOW_SIZE = 300  # chars of cleaned context around the homograph (half before, half after)
+
+    # Text-cleaning regexes (identical to upstream v1.5)
+    _re_remove_extra = re.compile(r'[^a-zA-Zа-яА-ЯёЁ0-9\s.!?,\-]')
+    _re_spaces = re.compile(r'\s+')
+    _re_double_dash = re.compile(r'-{2,}')
+    _re_repeat_punct = re.compile(r'([.!?])\1+')
+    _re_repeat_comma = re.compile(r',{2,}')
+    _re_space_before_punct = re.compile(r'\s+([.,!?])')
+    _re_punct_add_space = re.compile(r'([.,!?])(?=\S)')
 
     def __init__(self, device='cpu'):
         self._device_str = _parse_device(device)
@@ -283,9 +369,18 @@ class OnnxHomosolver:
         self.homodict = _load_gzip_json('ru', 'homodict_ru.json.gz')
         self.yohomodict = _load_gzip_json('ru', 'yohomodict_ru.json.gz')
 
+        # Built-in phrases ship pre-compiled: {word: pattern_string} (see scripts/export_ru.py)
+        self.compiled_phrases = _LazyRegexDict(_load_gzip_json('ru', 'phrases_ru.json.gz'), re.IGNORECASE)
+        self.compiled_user_phrases = {}
+        self.compiled_user_patterns = {}
+
         # Pattern matches words containing at least one Cyrillic letter, may include '+'
         # Original: r'(?=.*[а-яё])[а-яё+]+' with re.IGNORECASE
-        self.pattern = re.compile(r'(?=.*[а-яёА-ЯЁ])[а-яёА-ЯЁ+]+')
+        # Upstream: r'(?=.*[а-яё])[а-яё+]+' (IGNORECASE). Its '.*' lookahead rescans the rest of
+        # the line for every word (quadratic on long texts). For any run that contains a
+        # Cyrillic letter, '[+]*[а-яё]' accepts exactly the same spans; it only differs on
+        # runs made purely of '+', which can never be homographs.
+        self.pattern = re.compile(r'(?=[+]*[а-яёА-ЯЁ])[а-яёА-ЯЁ+]+')
         self.vowels = 'аоуыэиеяёюАОУЫЭИЕЯЁЮ'
 
     def _create_sessions(self):
@@ -307,6 +402,57 @@ class OnnxHomosolver:
         """Return current device string."""
         return self._device_str
 
+    # ------------------------------------------------------------------ #
+    # User overrides (same API and JSON formats as upstream v1.5)
+    # ------------------------------------------------------------------ #
+
+    def load_phrases_dict(self, phrases_dict_path):
+        """Load user-defined phrases from a JSON file (replaces previously loaded ones).
+
+        Format: {"замок": {"старинный замок": "з+амок", "закрыто на замок": "зам+ок"}}
+        """
+        if not os.path.exists(phrases_dict_path):
+            raise FileNotFoundError(f"There is no regex dict at: {phrases_dict_path}")
+        with open(phrases_dict_path, 'r', encoding='utf-8') as f:
+            self.compiled_user_phrases = _compile_phrases(json.load(f))
+        print(f'Loaded new phrases dict for {len(self.compiled_user_phrases)} words')
+
+    def load_regex_dict(self, regex_dict_path):
+        """Load user-defined regexes from a JSON file (merged into previously loaded ones).
+
+        Format: {"замок": {"з+амок": ["regex1", "regex2"], "зам+ок": ["regex3"]}}
+        Regexes are matched against the cleaned context (no [HOMO] markers),
+        in the order given.
+        """
+        if not os.path.exists(regex_dict_path):
+            raise FileNotFoundError(f"There is no regex dict at: {regex_dict_path}")
+        with open(regex_dict_path, 'r', encoding='utf-8') as f:
+            regex_dict = json.load(f)
+        for word, variant_to_regexes in regex_dict.items():
+            variant_patterns = []
+            for variant, regexes in variant_to_regexes.items():
+                group_name = _capitalize_stress(variant)
+                joined = '|'.join(f'(?:{r})' for r in regexes)
+                variant_patterns.append(rf'(?P<{group_name}>(?<![а-яА-ЯёЁ])(?:{joined})(?![а-яА-ЯёЁ]))')
+            try:
+                self.compiled_user_patterns[word] = re.compile('|'.join(variant_patterns), re.IGNORECASE | re.UNICODE)
+            except re.error as e:
+                raise ValueError(f"Error during regex compilation for word '{word}': {e}")
+        print(f'Loaded new regex dict for {len(self.compiled_user_patterns)} words')
+
+    @staticmethod
+    def _predict_with_pattern(pattern, text):
+        match = pattern.search(text)
+        if match:
+            for group_name, matched_text in match.groupdict().items():
+                if matched_text is not None:
+                    return _decapitalize_stress(group_name)
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Inference
+    # ------------------------------------------------------------------ #
+
     def __call__(self, text, put_stress_homo=True, put_yo_homo=True, stress_single_vowel=True):
         """Process text and resolve homographs.
 
@@ -316,153 +462,160 @@ class OnnxHomosolver:
             put_yo_homo: Replace е with ё in homographs
             stress_single_vowel: Add stress even for single-vowel words
         """
+        return self.batch([text], put_stress_homo, put_yo_homo, stress_single_vowel)[0]
+
+    def batch(self, texts, put_stress_homo=True, put_yo_homo=True, stress_single_vowel=True):
+        """Resolve homographs in several independent texts with one BERT call."""
         if not (put_stress_homo or put_yo_homo):
-            return text
+            return list(texts)
 
-        tagged = self._find_and_tag_homos(text, put_stress_homo, put_yo_homo)
-        if not tagged:
-            return text
+        # word_preds[i] = list of (start, end, word, variant) for texts[i]
+        word_preds = [[] for _ in texts]
+        neural = []  # (text_idx, slot_idx, word_lower, raw_mark)
 
-        # Use batched inference for efficiency
-        resolved = self._resolve_batch(tagged, put_stress_homo, put_yo_homo, stress_single_vowel)
+        for t_idx, text in enumerate(texts):
+            for start, end, word, word_lower, raw_mark, raw_clean in self._find_and_tag_homos(text):
+                pred = None
+                if word_lower in self.compiled_user_patterns:
+                    pred = self._predict_with_pattern(self.compiled_user_patterns[word_lower], raw_clean)
+                if pred is None and word_lower in self.compiled_user_phrases:
+                    pred = self._predict_with_pattern(self.compiled_user_phrases[word_lower], raw_mark)
+                if pred is None and word_lower in self.compiled_phrases:
+                    pred = self._predict_with_pattern(self.compiled_phrases[word_lower], raw_mark)
 
-        # Apply replacements
+                if pred is None:
+                    if word_lower not in self.homodict:
+                        continue
+                    neural.append((t_idx, len(word_preds[t_idx]), word_lower, raw_mark))
+                word_preds[t_idx].append([start, end, word, pred])
+
+        if neural:
+            preds = self._run_model([raw_mark for _, _, _, raw_mark in neural])
+            for (t_idx, slot, word_lower, _), pred in zip(neural, preds):
+                word_preds[t_idx][slot][3] = sorted(self.homodict[word_lower])[pred]
+
+        return [self._apply(text, wp, put_stress_homo, put_yo_homo, stress_single_vowel)
+                for text, wp in zip(texts, word_preds)]
+
+    def _apply(self, text, word_preds, put_stress, put_yo, stress_single_vowel):
+        """Write predicted variants back into text, preserving the original case."""
         result = text
         offset = 0
-        for start, end, word, word_pred_cased, extra_offset in resolved:
-            actual_start = start + offset
-            actual_end = end + offset
-            result = result[:actual_start] + word_pred_cased + result[actual_end:]
-            offset += extra_offset
-
+        for start, end, word, word_pred in word_preds:
+            start += offset
+            end += offset
+            if not put_yo:
+                word_pred = word_pred.replace('ё', 'е')
+            n_vowels = sum(c.lower() in 'аоуыэиеяёю' for c in word_pred)
+            stress_idx = word_pred.index('+')
+            word_pred = word_pred.replace('+', '')
+            word_pred = ''.join(c2.lower() if c1.islower() else c2.upper() for c1, c2 in zip(word, word_pred))
+            if (n_vowels > 1 or stress_single_vowel) and put_stress:
+                word_pred = word_pred[:stress_idx] + '+' + word_pred[stress_idx:]
+                offset += 1
+            result = result[:start] + word_pred + result[end:]
         return result
 
-    def _find_and_tag_homos(self, text, put_stress_homo, put_yo_homo):
-        """Find homographs and create marked versions."""
+    def _clean_text(self, text, is_start=True):
+        """Normalize context around a homograph (identical to upstream v1.5)."""
+        if not text:
+            return ""
+        text = self._re_remove_extra.sub('', text)
+        text = self._re_spaces.sub(' ', text)
+        text = self._re_double_dash.sub(' - ', text)
+        text = self._re_repeat_punct.sub(r'\1', text)
+        text = self._re_repeat_comma.sub(',', text)
+        text = self._re_space_before_punct.sub(r'\1', text)
+        text = self._re_repeat_punct.sub(r'\1', text)
+        text = self._re_repeat_comma.sub(',', text)
+        text = self._re_punct_add_space.sub(r'\1 ', text)
+        text = self._re_spaces.sub(' ', text).strip()
+        if is_start:
+            text = text.lstrip(' .,!?-')
+            if text:
+                text = text[0].upper() + text[1:].lower()
+        else:
+            if text:
+                text = text[0] + text[1:].lower()
+            if text and text[-1] not in '.!?':
+                text += '.'
+        return text
+
+    # Cleaning is local (every rule looks at a few neighbouring chars), so the last/first
+    # `half` cleaned chars only depend on a bounded raw neighbourhood. Clean a raw chunk and
+    # grow it until the result has a safety margin, instead of cleaning the whole prefix /
+    # suffix for every homograph (quadratic on long texts). Output is identical to
+    # _clean_text(text[:start])[-half:] / _clean_text(text[end:])[:half].
+    _CLEAN_MARGIN = 32
+
+    def _clean_left(self, text, start, half):
+        chunk = 4 * half
+        while True:
+            lo = max(0, start - chunk)
+            cleaned = self._clean_text(text[lo:start], is_start=True)
+            if lo == 0 or len(cleaned) >= half + self._CLEAN_MARGIN:
+                return cleaned[-half:]
+            chunk *= 2
+
+    def _clean_right(self, text, end, half):
+        chunk = 4 * half
+        while True:
+            hi = min(len(text), end + chunk)
+            cleaned = self._clean_text(text[end:hi], is_start=False)
+            if hi == len(text) or len(cleaned) >= half + self._CLEAN_MARGIN:
+                return cleaned[:half]
+            chunk *= 2
+
+    def _find_and_tag_homos(self, text):
+        """Find homograph candidates and build their (windowed, cleaned) contexts.
+
+        Returns list of (start, end, word, word_lower, raw_mark, raw_clean).
+        """
+        half = self.WINDOW_SIZE // 2
         tagged = []
         for match in self.pattern.finditer(text):
             word = match.group()
             word_lower = word.lower()
-            start, end = match.start(), match.end()
-
-            is_stress_homo = word_lower in self.homodict and put_stress_homo
-            is_yo_homo = word_lower in self.yohomodict and put_yo_homo
-
-            if is_stress_homo or is_yo_homo:
-                marked = text[:start] + ' [HOMO] ' + word + ' [/HOMO] ' + text[end:]
-                tagged.append((start, end, word, marked))
+            if not (word_lower in self.homodict
+                    or word_lower in self.compiled_phrases
+                    or word_lower in self.compiled_user_phrases
+                    or word_lower in self.compiled_user_patterns):
+                continue
+            start, end = match.span()
+            left = self._clean_left(text, start, half)
+            right = self._clean_right(text, end, half)
+            raw_mark = (left + ' [HOMO] ' + word_lower + ' [/HOMO] ' + right).strip()
+            raw_clean = (left + ' ' + word_lower + ' ' + right).strip()
+            tagged.append((start, end, word, word_lower, raw_mark, raw_clean))
         return tagged
 
-    def _encode_marked(self, marked_text):
-        """Encode text with [HOMO] markers."""
-        ids = self.tokenizer.encode(marked_text)
-        return np.array([ids], dtype=np.int64)
-
-    def _resolve_batch(self, tagged, put_stress_homo, put_yo_homo, stress_single_vowel):
-        """Resolve multiple homographs with batched BERT inference.
-
-        Args:
-            tagged: List of (start, end, word, marked_text) tuples
-            put_stress_homo: Add stress marks to homographs
-            put_yo_homo: Replace е with ё in homographs
-            stress_single_vowel: Add stress even for single-vowel words
-
-        Returns:
-            List of (start, end, word, predicted_word, extra_offset) tuples
-        """
-        if not tagged:
-            return []
-
-        # Step 1: Tokenize all marked texts
+    def _run_model(self, marked_texts):
+        """Batched BERT + classifier. Returns list of 0/1 variant indices."""
         all_ids = []
-        valid_indices = []  # Track which tagged entries have valid tokens
+        for marked in marked_texts:
+            ids = self.tokenizer.encode(marked)
+            hs = ids.index(self.tokenizer.homo_start_id)
+            he = ids.index(self.tokenizer.homo_end_id, hs)
+            all_ids.append((ids, hs, he))
 
-        for i, (start, end, word, marked_text) in enumerate(tagged):
-            ids = self.tokenizer.encode(marked_text)
-            homo_start = None
-            homo_end = None
-
-            for j, token_id in enumerate(ids):
-                if token_id == self.tokenizer.homo_start_id:
-                    homo_start = j
-                elif token_id == self.tokenizer.homo_end_id:
-                    homo_end = j
-                    break
-
-            if homo_start is not None and homo_end is not None:
-                all_ids.append((ids, homo_start, homo_end))
-                valid_indices.append(i)
-
-        if not all_ids:
-            return []
-
-        # Step 2: Pad to same length (pad_token_id=0)
+        # Pad to same length (pad_token_id)
         max_len = max(len(ids) for ids, _, _ in all_ids)
-        batch_ids = np.zeros((len(all_ids), max_len), dtype=np.int64)
-        homo_starts = []
-        homo_ends = []
-
-        for i, (ids, hs, he) in enumerate(all_ids):
+        batch_ids = np.full((len(all_ids), max_len), self.tokenizer.pad_token_id, dtype=np.int64)
+        for i, (ids, _, _) in enumerate(all_ids):
             batch_ids[i, :len(ids)] = ids
-            homo_starts.append(hs)
-            homo_ends.append(he)
 
-        # Step 3: Run BERT once on the batch
         hidden_states = self.bert_session.run(None, {'input_ids': batch_ids})[0]
 
-        # Step 4: Extract embeddings for all homographs
-        embeddings = np.empty((len(all_ids), 624), dtype=np.float32)  # 312*2
-        for i, (hs, he) in enumerate(zip(homo_starts, homo_ends)):
-            marker_emb = hidden_states[i, hs, :]
-            word_tokens = hidden_states[i, hs + 1:he, :]
-            word_emb = word_tokens.mean(axis=0)
-            embeddings[i] = np.concatenate([marker_emb, word_emb])
+        # Embedding = [HOMO] marker state ++ mean of the word's token states
+        dim = hidden_states.shape[-1]
+        embeddings = np.empty((len(all_ids), dim * 2), dtype=np.float32)
+        for i, (_, hs, he) in enumerate(all_ids):
+            embeddings[i, :dim] = hidden_states[i, hs]
+            embeddings[i, dim:] = hidden_states[i, hs + 1:he].mean(axis=0)
 
-        # Step 5: Run classifier on all embeddings at once
         logits = self.clf_session.run(None, {'embedding': embeddings})[0]
-        sigmoid_vals = 1 / (1 + np.exp(-logits[:, 0]))
-        preds = (sigmoid_vals > 0.5).astype(np.int32)
-
-        # Step 6: Map predictions back to original positions
-        results = []
-        for idx, valid_i in enumerate(valid_indices):
-            start, end, word, _ = tagged[valid_i]
-            pred = preds[idx]
-
-            word_lower = word.lower()
-            if word_lower in self.homodict:
-                variants = sorted(self.homodict[word_lower])
-            elif word_lower in self.yohomodict:
-                variants = sorted(self.yohomodict[word_lower])
-            else:
-                continue
-
-            word_pred = variants[pred]
-
-            # Handle yo replacement if disabled
-            if not put_yo_homo:
-                word_pred = word_pred.replace('ё', 'е')
-
-            n_vowels = sum(c.lower() in 'аоуыэиеяёю' for c in word_pred)
-            stress_idx = word_pred.index('+')
-            word_pred_no_stress = word_pred.replace('+', '')
-
-            # Apply case from original word to predicted word
-            word_pred_cased = ''.join(
-                c2.lower() if c1.islower() else c2.upper()
-                for c1, c2 in zip(word, word_pred_no_stress)
-            )
-
-            # Add stress mark if (multiple vowels OR stress_single_vowel) AND put_stress_homo
-            if (n_vowels > 1 or stress_single_vowel) and put_stress_homo:
-                word_pred_cased = word_pred_cased[:stress_idx] + '+' + word_pred_cased[stress_idx:]
-                extra_offset = 1
-            else:
-                extra_offset = 0
-
-            results.append((start, end, word, word_pred_cased, extra_offset))
-
-        return results
+        # round(sigmoid(x)) == (x > 0); upstream uses torch.round (0.5 -> 0)
+        return (logits[:, 0] > 0).astype(np.int64).tolist()
 
 
 class _AccentorBase:
@@ -533,7 +686,7 @@ class AccentorUkrBel(_AccentorBase):
     # Pre-compiled regex for tokenization
     _TOKEN_SPLIT_RE = re.compile(r'([\s.,!?;:<>=()/\\]+)')
     # Sentence boundary pattern (split on .!? followed by space or end)
-    _SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
+    _SENTENCE_SPLIT_RE = re.compile(r'((?<=[.!?])\s+)')
 
     def __init__(self, lang):
         super().__init__(lang)
@@ -589,9 +742,10 @@ class AccentorUkrBel(_AccentorBase):
     def __call__(self, text, **kwargs):
         """Process text and add stress marks. Auto-batches if multiple sentences detected."""
         # Auto-batch if multiple sentences
-        sentences = self._SENTENCE_SPLIT_RE.split(text)
-        if len(sentences) > 1:
-            return ' '.join(self.batch(sentences))
+        parts = self._SENTENCE_SPLIT_RE.split(text)
+        if len(parts) > 1:
+            sentences, seps = parts[0::2], parts[1::2]
+            return ''.join(s + sep for s, sep in zip(self.batch(sentences), seps + ['']))
 
         # Single sentence path
         sentence = text
@@ -737,7 +891,7 @@ class AccentorRu(_AccentorBase):
     _TOKEN_SPLIT_RE = re.compile(r'([\s.,!?;:<>=()/\\]+)')
     _CLEAN_RE = re.compile(r'[^А-Яа-яёЁ]')
     # Sentence boundary pattern
-    _SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
+    _SENTENCE_SPLIT_RE = re.compile(r'((?<=[.!?])\s+)')
 
     def __init__(self, use_homosolver=True, device='cpu'):
         super().__init__('ru')
@@ -833,17 +987,22 @@ class AccentorRu(_AccentorBase):
             put_yo_homo: Replace е with ё in homographs (requires homosolver)
             stress_single_vowel: Add stress even for single-vowel words
         """
-        # Auto-batch if multiple sentences
-        sentences = self._SENTENCE_SPLIT_RE.split(text)
-        if len(sentences) > 1:
-            return ' '.join(self.batch(sentences, put_stress=put_stress, put_yo=put_yo,
-                                       stress_single_vowel=stress_single_vowel,
-                                       put_stress_homo=put_stress_homo, put_yo_homo=put_yo_homo))
+        # Homographs first, on the FULL text: v1.5 uses a +-150 char window of context
+        # around each homograph that crosses sentence boundaries, like upstream.
+        if self.homosolver and (put_stress_homo or put_yo_homo):
+            text = self.homosolver(text, put_stress_homo, put_yo_homo, stress_single_vowel)
+
+        # Auto-batch the n-gram part if multiple sentences (separators are preserved)
+        parts = self._SENTENCE_SPLIT_RE.split(text)
+        if len(parts) > 1:
+            sentences, seps = parts[0::2], parts[1::2]
+            out = self.batch(sentences, put_stress=put_stress, put_yo=put_yo,
+                             stress_single_vowel=stress_single_vowel,
+                             put_stress_homo=False, put_yo_homo=False)
+            return ''.join(s + sep for s, sep in zip(out, seps + ['']))
 
         # Single sentence path
         sentence = text
-        if self.homosolver and (put_stress_homo or put_yo_homo):
-            sentence = self.homosolver(sentence, put_stress_homo, put_yo_homo, stress_single_vowel)
 
         if not put_stress and not put_yo:
             return sentence
@@ -1010,8 +1169,8 @@ class AccentorRu(_AccentorBase):
               put_stress_homo=True, put_yo_homo=True):
         """Process multiple sentences in a single batch for better throughput.
 
-        Note: Homograph resolution (BERT) is currently processed per-sentence.
-        MLP-based stress and yo prediction is fully batched.
+        Each sentence is an independent text: homographs in all of them are resolved
+        with a single BERT call, and MLP-based stress/yo prediction is fully batched.
 
         Args:
             sentences: List of input sentences
@@ -1027,10 +1186,9 @@ class AccentorRu(_AccentorBase):
         if not sentences:
             return []
 
-        # Process homographs first (per-sentence for now, BERT batching requires re-export)
+        # Process homographs first (one batched BERT call across all sentences)
         if self.homosolver and (put_stress_homo or put_yo_homo):
-            sentences = [self.homosolver(s, put_stress_homo, put_yo_homo, stress_single_vowel)
-                         for s in sentences]
+            sentences = self.homosolver.batch(sentences, put_stress_homo, put_yo_homo, stress_single_vowel)
 
         if not put_stress and not put_yo:
             return list(sentences)

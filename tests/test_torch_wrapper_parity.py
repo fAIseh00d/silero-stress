@@ -8,7 +8,7 @@ Tests include:
 3. Regression tests: Specific expected outputs
 4. Edge cases: Hyphenated words, single vowels, mixed case
 
-TorchAccentorRu is the verified-correct reference (100% parity with original 1.4).
+TorchAccentorRu is the verified-correct reference (wraps the original v1.5 package).
 """
 
 import re
@@ -486,6 +486,74 @@ class TestRussianAccentorParity(unittest.TestCase):
 
         self.assertEqual(matches, total,
             f"Match rate: {matches}/{total}. First mismatches: {mismatches[:5]}")
+
+
+@unittest.skipIf(not HAS_TORCH, "PyTorch required")
+@unittest.skipIf(not HAS_ONNX, "ONNX Runtime required")
+class TestRussianHomosolverV15(unittest.TestCase):
+    """v1.5 homosolver features: context cleaning/windowing, built-in phrases, user overrides.
+
+    Uses its own accentor instances because user dicts mutate homosolver state.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from silero_stress._torch_impl import TorchAccentorRu
+        from silero_stress._impl import AccentorRu
+        cls.torch_acc = TorchAccentorRu(use_homosolver=True, device='cpu')
+        cls.numpy_acc = AccentorRu(use_homosolver=True, device='cpu')
+
+    def assertParity(self, texts):
+        for text in texts:
+            with self.subTest(text=text[:60]):
+                self.assertEqual(self.numpy_acc(text), self.torch_acc(text))
+
+    def test_builtin_phrases(self):
+        """Built-in phrase overrides (skip the network) give the phrase's variant."""
+        h = self.numpy_acc.homosolver
+        self.assertGreater(len(h.compiled_phrases), 1000)
+        cases = {
+            'Это была страшная мука.': 'м+ука',
+            'Он расставил все по местам.': 'вс+ё',
+            'Людмила толстая пришла.': 'толст+ая',  # phrase-only word (not in homodict)
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertIn(expected, self.numpy_acc(text).lower())
+                self.assertEqual(self.numpy_acc(text), self.torch_acc(text))
+
+    def test_context_cleaning(self):
+        """Noisy punctuation/symbols are normalized identically before BERT."""
+        self.assertParity([
+            'Он!!!  -- готов,,,  а замок???',
+            '«Белки» (в лесу) — прыгали... по веткам;; дома @ #стоит',
+            'ЗАМОК НА ДВЕРИ БЫЛ СЛОМАН',
+            '...мука',
+            'атлас',
+            'Около дома -- стоит атлас...и белки!!!',
+        ])
+
+    def test_window_and_multi_sentence_context(self):
+        """Context crosses sentence boundaries and is cut to a 300-char window."""
+        filler = 'Мы долго шли по длинной дороге через лес и поле. ' * 8
+        self.assertParity([
+            'Мука была в мешке. Это была настоящая мука для него, и все это знали.',
+            'В замке было тихо. Замок открыли ключом? Нет, замок стоял на холме!',
+            filler + 'Старинный замок стоял на холме. ' + filler,
+            filler + 'Ключ не подходил, и замок не открывался.',
+            'Белки ' + filler,
+        ])
+
+    def test_whitespace_preserved(self):
+        """Multi-sentence auto-batching must not collapse separators."""
+        text = 'Привет.\nКак дела?\n\nВсе   хорошо!\tДо встречи.'
+        self.assertEqual(self.numpy_acc(text), self.torch_acc(text))
+        self.assertEqual(self.numpy_acc(text).replace('+', ''), text.replace('все', 'всё').replace('Все', 'Всё'))
+
+    def test_batch_matches_single(self):
+        texts = ['Высокий замок стоял.', 'Он взломал замок.', 'Страшная мука.', 'Без омографов тут.']
+        self.assertEqual(self.numpy_acc.batch(texts), [self.torch_acc(t) for t in texts])
+
 
 
 @unittest.skipIf(not HAS_TORCH, "PyTorch required")
