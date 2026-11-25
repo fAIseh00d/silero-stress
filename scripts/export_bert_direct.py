@@ -62,8 +62,8 @@ def gzip_files(remove_originals=True):
 def load_model():
     """Load the PyTorch model."""
     model_path = DATA_DIR / 'accentor.pt'
-    importer = torch.package.PackageImporter(str(model_path))
-    return importer.load_pickle('accentor_models', 'accentor')
+    with open(model_path, 'rb') as f:
+        return torch.package.PackageImporter(f).load_pickle('accentor_models', 'accentor')
 
 
 def export_weights():

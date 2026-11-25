@@ -47,8 +47,9 @@ class TorchAccentorRu:
 
         # Load model
         model_path = _get_data_path('accentor.pt')
-        importer = torch.package.PackageImporter(model_path)
-        self._model = importer.load_pickle('accentor_models', 'accentor')
+        # Open via file handle: PackageImporter fails on non-ASCII (e.g. Cyrillic) paths on Windows
+        with open(model_path, 'rb') as model_file:
+            self._model = torch.package.PackageImporter(model_file).load_pickle('accentor_models', 'accentor')
 
         # Restore quantized BERT embeddings (int8 -> float32)
         bert = self._model.homosolver.model.bert
@@ -102,8 +103,9 @@ class TorchAccentorUkrBel:
 
         # Load model
         model_path = _get_data_path(f'accentor-{lang}.pt')
-        importer = torch.package.PackageImporter(model_path)
-        self._model = importer.load_pickle('accentor_models', 'accentor')
+        # Open via file handle: PackageImporter fails on non-ASCII (e.g. Cyrillic) paths on Windows
+        with open(model_path, 'rb') as model_file:
+            self._model = torch.package.PackageImporter(model_file).load_pickle('accentor_models', 'accentor')
 
         # Restore quantized embeddings
         ngram_model = self._model.accentor.model

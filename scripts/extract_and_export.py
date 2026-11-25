@@ -27,8 +27,8 @@ def load_accentor(lang='ru'):
     model_name = 'accentor.pt' if lang == 'ru' else f'accentor-{lang}.pt'
     model_path = DATA_DIR / model_name
 
-    importer = torch.package.PackageImporter(str(model_path))
-    accentor = importer.load_pickle("accentor_models", "accentor")
+    with open(model_path, 'rb') as f:
+        accentor = torch.package.PackageImporter(f).load_pickle("accentor_models", "accentor")
 
     if lang == 'ru':
         quantized_weight = accentor.homosolver.model.bert.embeddings.word_embeddings.weight.data.clone()
@@ -113,8 +113,8 @@ def export_ukr_bel_model(lang):
 
     # Load RAW model first (before dequantization) to extract int8 weights
     model_path = DATA_DIR / f'accentor-{lang}.pt'
-    importer = torch.package.PackageImporter(str(model_path))
-    raw_accentor = importer.load_pickle("accentor_models", "accentor")
+    with open(model_path, 'rb') as f:
+        raw_accentor = torch.package.PackageImporter(f).load_pickle("accentor_models", "accentor")
     raw_model = raw_accentor.accentor.model
 
     # Extract int8 weights BEFORE dequantization

@@ -23,8 +23,8 @@ EXPORT_DIR = DATA_DIR
 def load_ru_accentor():
     """Load Russian accentor with weight restoration."""
     model_path = DATA_DIR / 'accentor.pt'
-    importer = torch.package.PackageImporter(str(model_path))
-    accentor = importer.load_pickle("accentor_models", "accentor")
+    with open(model_path, 'rb') as f:
+        accentor = torch.package.PackageImporter(f).load_pickle("accentor_models", "accentor")
 
     # Restore quantized BERT weights
     quantized_weight = accentor.homosolver.model.bert.embeddings.word_embeddings.weight.data.clone()
