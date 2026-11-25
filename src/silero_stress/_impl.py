@@ -662,15 +662,36 @@ class _AccentorBase:
         x = np.dot(x, weights['6_weight'].T) + weights['6_bias']
         return x
 
+    @staticmethod
+    def _confident_argmax(logits):
+        """argmax, or -1 where softmax confidence <= 0.5.
+
+        Upstream only applies an n-gram prediction when its softmax probability is > 0.5
+        (passed_stress_trs / passed_yo_trs); otherwise the word is left as is.
+        """
+        z = np.exp(logits - logits.max(axis=1, keepdims=True))
+        probs = z / z.sum(axis=1, keepdims=True)
+        preds = probs.argmax(axis=1)
+        preds[probs.max(axis=1) <= 0.5] = -1
+        return preds
+
     def _accentuate_word(self, word, stress_pos, is_char_pos=False):
-        """Add stress marker to word at predicted position."""
+        """Add stress marker to word at predicted position.
+
+        stress_pos < 0 (low-confidence prediction): leave the word unstressed, except
+        1-syllable words, which upstream always stresses.
+        """
         if is_char_pos:
             stress_idx = stress_pos
         else:
             vowel_ids = [i for i, c in enumerate(word.lower()) if c in self.vowels]
             if not vowel_ids:
                 return word
-            if stress_pos < len(vowel_ids):
+            if stress_pos < 0:
+                if len(vowel_ids) != 1:
+                    return word
+                stress_idx = vowel_ids[0]
+            elif stress_pos < len(vowel_ids):
                 stress_idx = vowel_ids[stress_pos]
             elif len(vowel_ids) == 1:
                 stress_idx = vowel_ids[0]
@@ -731,13 +752,13 @@ class AccentorUkrBel(_AccentorBase):
         alpha = ''.join(sorted(set(alpha + alpha.upper())))
         self._clean_re = re.compile(fr'[^{alpha}]')
 
-    def _predict_stress(self, words):
-        """Predict stress position for words."""
+    def _predict_stress(self, words):  # UKR/BEL
+        """Predict stress position for words (-1 = not confident, see _confident_argmax)."""
         if not words:
             return []
         embeddings = self._embed_words(words)
         logits = self._classify(embeddings, self.stress_weights)
-        return np.argmax(logits, axis=1).tolist()
+        return self._confident_argmax(logits).tolist()
 
     def __call__(self, text, **kwargs):
         """Process text and add stress marks. Auto-batches if multiple sentences detected."""
@@ -854,7 +875,7 @@ class AccentorUkrBel(_AccentorBase):
         if words_to_predict:
             embeddings = self._embed_words(words_to_predict)
             logits = self._classify(embeddings, self.stress_weights)
-            predictions = np.argmax(logits, axis=1)
+            predictions = self._confident_argmax(logits)
         else:
             predictions = []
 
@@ -978,14 +999,18 @@ class AccentorRu(_AccentorBase):
             return False
         return 'ё' in clean or sum(c in self.vowels for c in clean) > 1
 
-    def _predict_stress(self, words, embeddings=None):
-        """Predict stress positions. Optionally accepts pre-computed embeddings."""
+    def _predict_stress(self, words, embeddings=None, confident=False):
+        """Predict stress positions. Optionally accepts pre-computed embeddings.
+
+        confident=True: -1 where softmax confidence <= 0.5 (used for placing stress; the
+        ё check uses the raw argmax, like upstream's stress_preds).
+        """
         if not words:
             return []
         if embeddings is None:
             embeddings = self._embed_words(words)
         logits = self._classify(embeddings, self.stress_weights)
-        return np.argmax(logits, axis=1).tolist()
+        return (self._confident_argmax(logits) if confident else np.argmax(logits, axis=1)).tolist()
 
     def _predict_yo(self, words, embeddings=None):
         """Predict yo positions. Optionally accepts pre-computed embeddings."""
@@ -994,7 +1019,7 @@ class AccentorRu(_AccentorBase):
         if embeddings is None:
             embeddings = self._embed_words(words)
         logits = self._classify(embeddings, self.yo_weights)
-        return np.argmax(logits, axis=1).tolist()
+        return self._confident_argmax(logits).tolist()  # -1 = not confident -> no ё
 
     def _yo_replace_word(self, word, yo_pos, is_char_pos=False):
         """Replace 'е' with 'ё' at predicted position."""
@@ -1103,7 +1128,7 @@ class AccentorRu(_AccentorBase):
                     yo_words_to_predict.append(clean)
                     yo_word_indices.append(i)
 
-        stress_predictions = self._predict_stress(stress_words_to_predict) if stress_words_to_predict else []
+        stress_predictions = self._predict_stress(stress_words_to_predict, confident=True) if stress_words_to_predict else []
 
         # Compute yo embeddings once, reuse for both yo and stress predictions
         if yo_words_to_predict:
@@ -1152,7 +1177,7 @@ class AccentorRu(_AccentorBase):
                 elif i in yo_word_indices:
                     yo_pos = yo_predictions[yo_pred_idx]
                     yo_pred_idx += 1
-                    if yo_pos == 0:
+                    if yo_pos <= 0:
                         continue  # yo_clf says no conversion
 
                     e_positions = [j for j, c in enumerate(clean) if c == 'е']
@@ -1311,7 +1336,7 @@ class AccentorRu(_AccentorBase):
         if stress_words:
             stress_embeddings = self._embed_words(stress_words)
             stress_logits = self._classify(stress_embeddings, self.stress_weights)
-            stress_preds = np.argmax(stress_logits, axis=1)
+            stress_preds = self._confident_argmax(stress_logits)
         else:
             stress_preds = []
 
@@ -1321,7 +1346,7 @@ class AccentorRu(_AccentorBase):
         if yo_words:
             yo_embeddings = self._embed_words(yo_words)
             yo_logits = self._classify(yo_embeddings, self.yo_weights)
-            yo_preds = np.argmax(yo_logits, axis=1)
+            yo_preds = self._confident_argmax(yo_logits)
             # Also get stress predictions for yo words
             yo_stress_logits = self._classify(yo_embeddings, self.stress_weights)
             yo_stress_preds = np.argmax(yo_stress_logits, axis=1)
@@ -1361,7 +1386,7 @@ class AccentorRu(_AccentorBase):
 
                     elif key in yo_pred_map:
                         yo_pos = yo_pred_map[key]
-                        if yo_pos == 0:
+                        if yo_pos <= 0:
                             continue
 
                         e_positions = [j for j, c in enumerate(clean) if c == 'е']

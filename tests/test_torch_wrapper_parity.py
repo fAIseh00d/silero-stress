@@ -574,6 +574,13 @@ class TestRussianHomosolverV15(unittest.TestCase):
                 self.assertEqual([self.numpy_acc(t, **f) for t in texts], ref)
                 self.assertEqual(self.numpy_acc.batch(texts, **f), ref)
 
+    def test_low_confidence_left_unstressed(self):
+        """Upstream only applies n-gram predictions with softmax p > 0.5."""
+        text = 'Максим, вернувшись к сторожу.'
+        self.assertEqual(self.numpy_acc(text), self.torch_acc(text))
+        self.assertIn(' сторожу.', self.numpy_acc(text))
+        self.assertEqual(self.numpy_acc.batch([text])[0], self.torch_acc(text))
+
     def test_user_phrases_and_regex(self):
         """load_phrases_dict / load_regex_dict with upstream's example files."""
         from silero_stress._torch_impl import TorchAccentorRu
