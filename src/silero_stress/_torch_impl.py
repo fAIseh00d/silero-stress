@@ -74,6 +74,19 @@ class TorchAccentorRu:
         """Return current device string."""
         return self._device_str
 
+    @property
+    def homosolver(self):
+        """Underlying upstream HomoSolver (same object as upstream `accentor.homosolver`)."""
+        return self._model.homosolver
+
+    def load_phrases_dict(self, path):
+        """Load user phrases JSON (v1.5 format) into the homosolver."""
+        self._model.homosolver.load_phrases_dict(str(path))
+
+    def load_regex_dict(self, path):
+        """Load user regex JSON (v1.5 format) into the homosolver."""
+        self._model.homosolver.load_regex_dict(str(path))
+
     def __call__(self, sentence, put_stress=True, put_yo=True,
                  put_stress_homo=True, put_yo_homo=True, stress_single_vowel=True, **kwargs):
         """Process sentence and add stress marks.

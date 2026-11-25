@@ -488,6 +488,9 @@ class TestRussianAccentorParity(unittest.TestCase):
             f"Match rate: {matches}/{total}. First mismatches: {mismatches[:5]}")
 
 
+REGEX_EXAMPLES = Path(__file__).parent.parent / 'src' / 'silero_stress' / 'data' / 'regex_examples'
+
+
 @unittest.skipIf(not HAS_TORCH, "PyTorch required")
 @unittest.skipIf(not HAS_ONNX, "ONNX Runtime required")
 class TestRussianHomosolverV15(unittest.TestCase):
@@ -554,6 +557,28 @@ class TestRussianHomosolverV15(unittest.TestCase):
         texts = ['Высокий замок стоял.', 'Он взломал замок.', 'Страшная мука.', 'Без омографов тут.']
         self.assertEqual(self.numpy_acc.batch(texts), [self.torch_acc(t) for t in texts])
 
+    def test_user_phrases_and_regex(self):
+        """load_phrases_dict / load_regex_dict with upstream's example files."""
+        from silero_stress._torch_impl import TorchAccentorRu
+        from silero_stress._impl import AccentorRu
+        t = TorchAccentorRu(use_homosolver=True, device='cpu')
+        n = AccentorRu(use_homosolver=True, device='cpu')
+        for acc in (t, n):
+            acc.load_phrases_dict(REGEX_EXAMPLES / 'phrases_example.json')
+            acc.load_regex_dict(REGEX_EXAMPLES / 'regex_example.json')
+
+        cases = {
+            'Это был высокий замок.': 'з+амок',
+            'Он решил взломать замок.': 'зам+ок',
+            'Вкусные пельмени!': 'пельм+ени',
+            'Это проклятые пельмени сатаны.': 'п+ельмени',
+            'Они все до одного пришли.': 'вс+е',          # regex -> вс+е
+            'Ну все же пришли.': 'вс+ё',                    # regex -> вс+ё
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(n(text), t(text))
+                self.assertIn(expected, n(text).lower())
 
 
 @unittest.skipIf(not HAS_TORCH, "PyTorch required")

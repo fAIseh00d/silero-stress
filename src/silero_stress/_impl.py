@@ -929,6 +929,25 @@ class AccentorRu(_AccentorBase):
             self.homosolver.to(device)
         return self
 
+    def _require_homosolver(self):
+        if self.homosolver is None:
+            raise RuntimeError("Homosolver is not loaded (use_homosolver=False or onnxruntime missing)")
+        return self.homosolver
+
+    def load_phrases_dict(self, path):
+        """Load user phrases JSON (v1.5 format) into the homosolver.
+
+        Same as `accentor.homosolver.load_phrases_dict(path)`.
+        """
+        self._require_homosolver().load_phrases_dict(str(path))
+
+    def load_regex_dict(self, path):
+        """Load user regex JSON (v1.5 format) into the homosolver.
+
+        Same as `accentor.homosolver.load_regex_dict(path)`.
+        """
+        self._require_homosolver().load_regex_dict(str(path))
+
     @property
     def device(self):
         """Return current device string."""
